@@ -1,0 +1,14 @@
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/worktrees/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+dist/
+build/
+
+.DS_Store
