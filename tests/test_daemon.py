@@ -75,3 +75,19 @@ def test_create_app_builds_graph_when_missing(tmp_path, fixture_repo):
     create_app(graph_out, target=fixture_repo)
 
     assert (graph_out / "graph.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_daemon_serves_delegate_mcp_over_real_http(running_daemon):
+    async with sse_client(f"{running_daemon}/delegate/sse") as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            assert [t.name for t in tools.tools] == ["delegate_to_local"]
+
+            result = await session.call_tool(
+                "delegate_to_local",
+                {"task": "Reply with the single word: pong. No punctuation."},
+            )
+            payload = result.content[0].text
+            assert "pong" in payload.lower()
