@@ -12,6 +12,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from josu.config import resolve_config_path
 from josu.daemon import DEFAULT_HOST, DEFAULT_PORT
 
 
@@ -24,8 +25,12 @@ def _cmd_daemon_start(args: argparse.Namespace) -> int:
 
     graph_out_dir = Path(args.graph_out_dir) if args.graph_out_dir else _default_graph_out_dir()
     target = Path(args.target) if args.target else Path.cwd()
-    print(f"Starting josu daemon on {args.host}:{args.port} (graph: {graph_out_dir}, target: {target})")
-    run(graph_out_dir, host=args.host, port=args.port, target=target)
+    config_path = Path(args.config) if args.config else resolve_config_path()
+    print(
+        f"Starting josu daemon on {args.host}:{args.port} "
+        f"(graph: {graph_out_dir}, target: {target}, config: {config_path})"
+    )
+    run(graph_out_dir, host=args.host, port=args.port, target=target, config_path=config_path)
     return 0
 
 
@@ -43,6 +48,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--graph-out-dir",
         default=None,
         help="Where the graph is persisted (default: ./.josu/graphify-out)",
+    )
+    start_parser.add_argument(
+        "--target",
+        default=None,
+        help="Project root to build the graph from if none exists yet (default: cwd)",
+    )
+    start_parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to josu.toml (candidate/chain config). Defaults to the "
+            "XDG-style location config/__init__.py resolves "
+            "(~/.config/josu/josu.toml, or $XDG_CONFIG_HOME/josu/josu.toml)."
+        ),
     )
     start_parser.set_defaults(func=_cmd_daemon_start)
 

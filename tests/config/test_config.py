@@ -96,3 +96,37 @@ def test_load_config_strict_mode_raises_instead_of_warning(tmp_path):
 
     with pytest.raises(ConfigPermissionError):
         load_config(config_path, strict=True)
+
+
+def test_load_config_composes_chains_alongside_delegate_candidates(tmp_path):
+    """U12: `load_config()` also validates the `[delegation]` section
+    (config/chains.py, U3) from the same `josu.toml` read, so `daemon.py`
+    gets both the candidate registry and the fallback chains that
+    reference it from one call."""
+    config_path = tmp_path / "josu.toml"
+    config_path.write_text(
+        "[[delegate.candidates]]\n"
+        'name = "local-candidate"\n'
+        'endpoint = "http://localhost:11434/v1"\n'
+        "local = true\n"
+        'model = "qwen2.5-coder:7b"\n'
+        "\n"
+        "[[delegation.chains]]\n"
+        'task_type = "file_summarization"\n'
+        'candidates = ["local-candidate"]\n',
+        encoding="utf-8",
+    )
+    os.chmod(config_path, 0o600)
+
+    config = load_config(config_path)
+    assert len(config.chains.chains) == 1
+    assert config.chains.chains[0].task_type == "file_summarization"
+
+
+def test_load_config_defaults_chains_empty_when_no_delegation_section(tmp_path):
+    config_path = tmp_path / "josu.toml"
+    _write_toml(config_path)
+    os.chmod(config_path, 0o600)
+
+    config = load_config(config_path)
+    assert config.chains.chains == []

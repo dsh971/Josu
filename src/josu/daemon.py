@@ -8,6 +8,13 @@ defeating the reason a single shared daemon exists. Every per-worktree
 --mcp-config manifest and every direct-call path (quota fallback, proactive
 checks) points at this same running instance. See plan Key Technical
 Decisions.
+
+U12: startup loads `josu.toml` (via `config/__init__.py`, which composes
+U11's candidate registry and U3's fallback-chain schema) and passes the
+resolved config into the delegate server's construction, replacing the
+single hardcoded `delegate_model` string U1/U2 shipped with -- the daemon
+no longer knows about "a model", only about the candidate/chain config a
+developer has authored.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from starlette.applications import Starlette
 from starlette.responses import Response
 from starlette.routing import Mount, Route
 
+from josu.config import JosuConfig, load_config
 from josu.delegate.local_model import DEFAULT_TIMEOUT_SECONDS
 from josu.delegate.server import build_server as build_delegate_server
 from josu.graph.build import GraphifyEngine
@@ -27,13 +35,13 @@ from josu.graph.server import build_server as build_graph_server
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-DEFAULT_DELEGATE_MODEL = "qwen2.5-coder:7b"
 
 
 def create_app(
     graph_out_dir: Path,
     target: Path | None = None,
-    delegate_model: str = DEFAULT_DELEGATE_MODEL,
+    config: JosuConfig | None = None,
+    config_path: Path | None = None,
     delegate_timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> Starlette:
     """Build the Starlette ASGI app mounting both MCP servers over SSE.
@@ -42,18 +50,32 @@ def create_app(
     `target` (defaulting to the current directory) before serving --
     otherwise the daemon would come up with nothing to answer queries with.
 
+    `config` is the already-loaded `josu.toml` contents; if omitted, it's
+    loaded here via `config/__init__.py.load_config(config_path)`
+    (`config_path=None` resolves the XDG-style default location). Passing
+    `config` directly lets tests construct a fixture config without writing
+    a real file to disk when they don't need to also exercise path
+    resolution/permission checks.
+
     The delegate server shares this same process and holds the one graph
     engine instance, so its queue (U2) is genuinely process-wide rather than
     per-worktree, and it queries the same graph the orchestrator does (R8).
     """
+    if config is None:
+        config = load_config(config_path)
+
     engine = GraphifyEngine(out_dir=graph_out_dir)
     if not engine.graph_path.exists():
         engine.build(target or Path.cwd())
     graph_server = build_graph_server(engine)
     graph_sse = SseServerTransport("/graph/messages/")
 
+    registry = {candidate.name: candidate for candidate in config.delegate.candidates}
     delegate_server = build_delegate_server(
-        graph_engine=engine, model=delegate_model, timeout=delegate_timeout
+        graph_engine=engine,
+        chains_config=config.chains,
+        registry=registry,
+        timeout=delegate_timeout,
     )
     delegate_sse = SseServerTransport("/delegate/messages/")
 
@@ -89,13 +111,15 @@ def run(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     target: Path | None = None,
-    delegate_model: str = DEFAULT_DELEGATE_MODEL,
+    config: JosuConfig | None = None,
+    config_path: Path | None = None,
     delegate_timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> None:
     app = create_app(
         graph_out_dir,
         target=target,
-        delegate_model=delegate_model,
+        config=config,
+        config_path=config_path,
         delegate_timeout=delegate_timeout,
     )
     uvicorn.run(app, host=host, port=port, log_level="warning")

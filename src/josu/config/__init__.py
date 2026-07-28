@@ -7,9 +7,12 @@ worktree allowlist could sweep it into an unattended commit. Load stats the
 file and warns (or refuses, in `strict` mode) if group/world-readable bits
 are set, mirroring `ssh`'s own private-key permission convention.
 
-This unit (U11) only composes the delegate-candidate registry
-(`config/delegate.py`); `config/chains.py` (U3) and `config/orchestrator.py`
-(U4) don't exist yet and are wired in by their own units.
+U11 composed only the delegate-candidate registry (`config/delegate.py`).
+U12 wires in `config/chains.py` (U3) alongside it, so a single `load_config()`
+call gives `daemon.py` everything it needs to construct a chain-aware
+delegate server -- the candidate roster and the fallback chains that
+reference it -- from one `josu.toml` read. `config/orchestrator.py` (U4)
+doesn't exist yet and is wired in by its own unit.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from josu.config.chains import ChainsConfig, load_chains_config
 from josu.config.delegate import DelegateConfig, load_delegate_config
 
 DEFAULT_CONFIG_DIRNAME = "josu"
@@ -75,12 +79,13 @@ class JosuConfig:
 
     path: Path
     delegate: DelegateConfig
+    chains: ChainsConfig = field(default_factory=ChainsConfig)
     warnings: list[str] = field(default_factory=list)
 
 
 def load_config(path: Path | None = None, *, strict: bool = False) -> JosuConfig:
     """Resolve (or use the given) `josu.toml` path, check its permissions,
-    parse it, and validate its `[delegate]` section.
+    parse it, and validate its `[delegate]` and `[delegation]` sections.
 
     Permission and env-var-existence problems become warnings on `config`
     (never raised) unless `strict=True`, in which case a permission problem
@@ -95,4 +100,12 @@ def load_config(path: Path | None = None, *, strict: bool = False) -> JosuConfig
     delegate_config, delegate_warnings = load_delegate_config(data)
     warnings.extend(delegate_warnings)
 
-    return JosuConfig(path=resolved, delegate=delegate_config, warnings=warnings)
+    chains_config, chains_warnings = load_chains_config(data)
+    warnings.extend(chains_warnings)
+
+    return JosuConfig(
+        path=resolved,
+        delegate=delegate_config,
+        chains=chains_config,
+        warnings=warnings,
+    )
