@@ -1,15 +1,24 @@
-"""Wraps ollama.chat as the local delegate (R4).
+"""Runs one bounded delegate call against a configured candidate (R4).
 
 Structures every response as `{result, caveats}` -- `caveats` carries the
-local model's own uncertainty notes, which Claude Code's tool description
+delegate model's own uncertainty notes, which Claude Code's tool description
 (U3) tells it to treat as a spot-check signal. Queries the same context
 graph the hosted orchestrator uses (R8); when the graph has no relevant data,
 falls back to direct file exploration within scope rather than blocking
 (R13), since a graph miss is exactly as likely here as it is for U4's
 orchestrator-side fallback.
 
-`delegate()` itself is synchronous and blocking -- serialization and timeout
-enforcement are queue.py's job (via asyncio.to_thread), not this module's.
+`delegate()` is `async def` and client-agnostic -- it's typed against
+`client.py`'s `DelegateClient` Protocol, not any one transport, so Ollama is
+just one configured candidate pointed at its own OpenAI-compatible `/v1`
+endpoint, not a special-cased code path. Serialization and per-call timeout
+enforcement are `queue.py`'s job, not this module's.
+
+The hardware pre-flight check (R26) does NOT run inside `delegate()` -- it
+used to, but the local/remote distinction that check depends on lives with
+chain-execution logic (U12's `chain.py`), which calls `preflight_check`
+itself before attempting a candidate it already knows is local. This unit
+does not reintroduce that gate; `delegate()` never gates on hardware fit.
 """
 
 from __future__ import annotations
@@ -19,12 +28,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import ollama
-
+from josu.delegate.client import (
+    DelegateClient,
+    DelegateMalformedResponseError,
+    OpenAICompatibleDelegateClient,
+)
 from josu.graph.engine import GraphEngine
-from josu.models.curated import preflight_check
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
+
+# Ollama's own OpenAI-compatible endpoint -- used only when no client is
+# injected, matching the previous module-level `ollama.chat` default.
+DEFAULT_ENDPOINT = "http://localhost:11434/v1"
 
 _SYSTEM_PROMPT = (
     'Respond only with a JSON object of the shape {"result": <string>, '
@@ -34,20 +49,11 @@ _SYSTEM_PROMPT = (
 )
 
 
-class LocalModelUnreachableError(RuntimeError):
-    """Raised when Ollama itself cannot be reached (connection refused/daemon down)."""
-
-
-class LocalModelMalformedResponseError(RuntimeError):
-    """Raised when the local model's response can't be parsed even after one retry."""
-
-
 @dataclass(frozen=True)
 class DelegateResult:
     result: str
     caveats: str
     model: str
-    preflight_warning: str | None = None
 
 
 def _coerce_task_args(task: Any, scope: Any) -> tuple[str, dict]:
@@ -89,28 +95,28 @@ def _fallback_file_context(root: Path, limit: int = 5) -> list[str]:
     return [str(p) for p in sorted(root.rglob("*")) if p.is_file()][:limit]
 
 
-def delegate(
+async def delegate(
     task: Any,
     scope: Any = None,
     *,
     model: str = "qwen2.5-coder:7b",
     graph_engine: GraphEngine | None = None,
     scope_root: Path | None = None,
-    client: ollama.Client | None = None,
-    available_ram_gb: float | None = None,
+    client: DelegateClient | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> DelegateResult:
-    """Run one bounded delegate call against the local model.
+    """Run one bounded delegate call against `client` (or a default Ollama
+    OpenAI-compatible client if none is given).
 
-    `available_ram_gb` overrides the real-machine reading `preflight_check`
-    would otherwise take -- real RAM fluctuates run to run, so callers that
-    only care about response parsing or connection handling (not R26 itself)
-    should pass a fixed value to keep the pre-flight gate deterministic.
+    Raises `DelegateUnreachableError`, `DelegateRateLimitedError`, or
+    `DelegateAPIError` (from `client.py`) immediately, un-retried -- those
+    feed U12's chain-advance logic, not a same-candidate retry. A malformed
+    response (from the client itself, or from this function's own parse of
+    the model's `{result, caveats}` content) triggers exactly one
+    same-candidate retry before raising `DelegateMalformedResponseError`
+    (R24).
     """
     task, scope = _coerce_task_args(task, scope)
-
-    preflight = preflight_check(model, available_ram_gb=available_ram_gb)
-    if not preflight.ok:
-        raise ValueError(f"pre-flight check failed: {preflight.reason}")
 
     context = _graph_context(graph_engine, task)
     if not context and scope_root is not None:
@@ -124,31 +130,34 @@ def delegate(
         },
     ]
 
-    chat = client.chat if client is not None else ollama.chat
-
-    def _call() -> str:
-        try:
-            response = chat(model=model, messages=messages, format="json")
-        except ConnectionError as exc:
-            raise LocalModelUnreachableError(f"local model unreachable: {exc}") from exc
-        return response["message"]["content"]
-
-    content = _call()
-    try:
-        result, caveats = _parse_response(content)
-    except (json.JSONDecodeError, KeyError, TypeError):
-        # One retry on a genuinely unparseable response (R24).
-        content = _call()
-        try:
-            result, caveats = _parse_response(content)
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise LocalModelMalformedResponseError(
-                f"local model returned an unparseable response after retry: {content!r}"
-            ) from exc
-
-    return DelegateResult(
-        result=result,
-        caveats=caveats,
-        model=model,
-        preflight_warning=preflight.reason if not preflight.curated else None,
+    active_client = (
+        client
+        if client is not None
+        else OpenAICompatibleDelegateClient(DEFAULT_ENDPOINT, name=model)
     )
+
+    async def _attempt() -> tuple[str, str] | None:
+        """One call-and-parse attempt. Returns None on ANY malformation
+        (envelope-level from the client, or content-level from our own
+        `{result, caveats}` parse) so both feed the same retry-once path.
+        Unreachable/rate-limited/API-error exceptions are NOT caught here --
+        they propagate immediately, un-retried."""
+        try:
+            content = await active_client.complete(model=model, messages=messages, timeout=timeout)
+        except DelegateMalformedResponseError:
+            return None
+        try:
+            return _parse_response(content)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+
+    parsed = await _attempt()
+    if parsed is None:
+        parsed = await _attempt()
+    if parsed is None:
+        raise DelegateMalformedResponseError(
+            model, "response could not be parsed as {result, caveats} after retry"
+        )
+
+    result, caveats = parsed
+    return DelegateResult(result=result, caveats=caveats, model=model)

@@ -314,6 +314,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "graphifyy" },
+    { name = "httpx" },
     { name = "mcp" },
     { name = "ollama" },
     { name = "psutil" },
@@ -330,6 +331,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "graphifyy" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "mcp", specifier = ">=1.0,<2.0" },
     { name = "ollama", specifier = ">=0.4" },
     { name = "psutil", specifier = ">=6.0" },

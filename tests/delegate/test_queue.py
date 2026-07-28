@@ -1,7 +1,13 @@
-"""Tests for the delegate queue's serialization and timeout semantics (U2)."""
+"""Tests for the delegate queue's serialization and timeout semantics (U2, U11).
+
+U11 changes `run()` to await a coroutine-returning callable directly instead
+of bridging a sync callable through `asyncio.to_thread` -- these tests now
+pass `async def` callables, matching the new contract.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
@@ -15,15 +21,13 @@ async def test_concurrent_calls_are_serialized_not_overlapping():
     intervals: list[tuple[float, float]] = []
 
     def make_task(duration: float):
-        def _run():
+        async def _run():
             start = time.monotonic()
-            time.sleep(duration)
+            await asyncio.sleep(duration)
             intervals.append((start, time.monotonic()))
             return "done"
 
         return _run
-
-    import asyncio
 
     results = await asyncio.gather(
         queue.run(make_task(0.1), timeout=5),
@@ -41,14 +45,12 @@ async def test_concurrent_calls_are_serialized_not_overlapping():
 async def test_timeout_clock_starts_at_execution_not_arrival():
     queue = DelegateQueue()
 
-    def slow():
-        time.sleep(0.2)
+    async def slow():
+        await asyncio.sleep(0.2)
         return "done"
 
-    def fast():
+    async def fast():
         return "fast-done"
-
-    import asyncio
 
     # `slow` occupies the lock for 0.2s. `fast`'s own timeout (0.05s) should
     # only start once `slow` releases the lock and `fast` begins executing --
@@ -65,8 +67,8 @@ async def test_timeout_clock_starts_at_execution_not_arrival():
 async def test_run_raises_timeout_error_when_execution_exceeds_budget():
     queue = DelegateQueue()
 
-    def slow():
-        time.sleep(0.2)
+    async def slow():
+        await asyncio.sleep(0.2)
         return "done"
 
     with pytest.raises(TimeoutError):

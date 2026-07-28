@@ -15,12 +15,14 @@ from pathlib import Path
 import mcp.types as types
 from mcp.server.lowlevel import Server
 
-from josu.delegate.local_model import (
-    DEFAULT_TIMEOUT_SECONDS,
-    LocalModelMalformedResponseError,
-    LocalModelUnreachableError,
-    delegate,
+from josu.delegate.client import (
+    DelegateAPIError,
+    DelegateClient,
+    DelegateMalformedResponseError,
+    DelegateRateLimitedError,
+    DelegateUnreachableError,
 )
+from josu.delegate.local_model import DEFAULT_TIMEOUT_SECONDS, delegate
 from josu.delegate.queue import DelegateQueue
 from josu.graph.engine import GraphEngine
 
@@ -39,6 +41,7 @@ def build_server(
     model: str = "qwen2.5-coder:7b",
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     name: str = "delegate-to-local",
+    client: DelegateClient | None = None,
 ) -> Server:
     """Construct the low-level MCP server bound to the given graph engine."""
     server: Server = Server(name)
@@ -80,27 +83,28 @@ def build_server(
             Path(scope["path"]) if isinstance(scope, dict) and "path" in scope else None
         )
 
-        def _run() -> dict:
-            outcome = delegate(
+        async def _run() -> dict:
+            outcome = await delegate(
                 task,
                 scope,
                 model=model,
                 graph_engine=graph_engine,
                 scope_root=scope_root,
+                client=client,
+                timeout=timeout,
             )
             return {
                 "result": outcome.result,
                 "caveats": outcome.caveats,
                 "model": outcome.model,
-                "preflight_warning": outcome.preflight_warning,
             }
 
         try:
             payload = await queue.run(_run, timeout=timeout)
-        except LocalModelUnreachableError as exc:
+        except DelegateUnreachableError as exc:
             return [
                 types.TextContent(
-                    type="text", text=f"error: local model unreachable: {exc}", annotations=None
+                    type="text", text=f"error: delegate unreachable: {exc}", annotations=None
                 )
             ]
         except TimeoutError:
@@ -111,7 +115,10 @@ def build_server(
                     annotations=None,
                 )
             ]
-        except (LocalModelMalformedResponseError, ValueError) as exc:
+        except (DelegateRateLimitedError, DelegateAPIError, DelegateMalformedResponseError) as exc:
+            # Chain-advance-vs-retry decisioning for these (R34/R24) is U12's
+            # job (chain.py); this unit's single-candidate tool surfaces
+            # whichever of the four the one configured candidate raised.
             return [types.TextContent(type="text", text=f"error: {exc}", annotations=None)]
 
         return [

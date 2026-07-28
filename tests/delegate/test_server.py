@@ -1,22 +1,26 @@
-"""Tests for the delegate-to-local MCP server (U2).
+"""Tests for the delegate-to-local MCP server (U2, U11).
 
-The happy path exercises a real Ollama call against the curated
-qwen2.5-coder:7b model -- no mocks, matching U1's testing philosophy. The
-error paths (unreachable daemon, malformed response) are exercised through
-a hand-written fake implementing ollama.Client's `.chat()` shape, since
-those failure modes aren't reliably reproducible against a real model on
-demand.
+The happy path exercises a real Ollama call (through the new generic
+async client, wired to Ollama's OpenAI-compatible endpoint) end to end via
+the MCP surface -- no mocks, matching U1's testing philosophy. Error-path
+tests exercise the full `call_tool` -> `queue.run()` -> `delegate()` ->
+`client.py` async path via a hand-written fake `DelegateClient`, proving
+U11 kept the existing single-candidate tool fully working on the new
+fully-async path with no remaining synchronous bridging.
+
+`delegate()`-level behavior (retry semantics, graph fallback, etc.) is
+covered independently in `test_local_model.py`; this module only covers the
+MCP transport and tool-schema surface.
 """
 
 from __future__ import annotations
 
 import json
 
-import ollama
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from josu.delegate.local_model import delegate
+from josu.delegate.client import DelegateRateLimitedError, DelegateUnreachableError
 from josu.delegate.server import build_server
 from josu.graph.build import GraphifyEngine
 
@@ -38,29 +42,27 @@ def built_engine(tmp_path, fixture_repo):
     return engine
 
 
-class FakeMalformedTwiceClient:
-    """Fake ollama client returning unparseable content on every call."""
+class FakeGoodClient:
+    """Fake `DelegateClient` returning a well-formed response immediately."""
 
-    def chat(self, model, messages, format=None):
-        return {"message": {"content": "not json at all"}}
-
-
-class FakeMalformedThenGoodClient:
-    """Fake ollama client that fails to parse once, then succeeds on retry."""
-
-    def __init__(self):
+    def __init__(self, result="ok", caveats=""):
+        self._result = result
+        self._caveats = caveats
         self.calls = 0
 
-    def chat(self, model, messages, format=None):
+    async def complete(self, *, model, messages, timeout):
         self.calls += 1
-        if self.calls == 1:
-            return {"message": {"content": "not json"}}
-        return {"message": {"content": json.dumps({"result": "ok", "caveats": "retried"})}}
+        return json.dumps({"result": self._result, "caveats": self._caveats})
 
 
 class FakeUnreachableClient:
-    def chat(self, model, messages, format=None):
-        raise ConnectionError("connection refused")
+    async def complete(self, *, model, messages, timeout):
+        raise DelegateUnreachableError("fake-candidate")
+
+
+class FakeRateLimitedClient:
+    async def complete(self, *, model, messages, timeout):
+        raise DelegateRateLimitedError("fake-candidate", retry_after="12")
 
 
 @pytest.mark.asyncio
@@ -76,8 +78,7 @@ async def test_delegate_bounded_task_returns_result_and_caveats(built_engine, fi
     server = build_server(graph_engine=built_engine)
     async with create_connected_server_and_client_session(server) as client:
         # Self-contained task -- doesn't depend on graph/file context resolving
-        # to anything, since that retrieval quality is covered separately by
-        # test_delegate_falls_back_to_file_exploration_when_graph_has_no_match.
+        # to anything specific.
         result = await client.call_tool(
             "delegate_to_local",
             {
@@ -93,47 +94,36 @@ async def test_delegate_bounded_task_returns_result_and_caveats(built_engine, fi
         assert "caveats" in payload
 
 
-def test_delegate_retries_once_on_malformed_response_then_succeeds():
-    client = FakeMalformedThenGoodClient()
-    outcome = delegate("summarize", client=client, available_ram_gb=64.0)
-    assert outcome.result == "ok"
-    assert outcome.caveats == "retried"
-    assert client.calls == 2
+@pytest.mark.asyncio
+async def test_delegate_tool_round_trips_on_fully_async_path_with_fake_client():
+    """The full stack -- MCP `call_tool` -> `queue.run()` -> `delegate()` ->
+    `client.py` -- round-trips through a fake `DelegateClient`, proving no
+    synchronous bridging remains anywhere on the path (U11's verification
+    goal)."""
+    fake_client = FakeGoodClient(result="42", caveats="none")
+    server = build_server(client=fake_client)
+    async with create_connected_server_and_client_session(server) as client:
+        result = await client.call_tool("delegate_to_local", {"task": "compute the answer"})
+        payload = json.loads(result.content[0].text)
+        assert payload["result"] == "42"
+        assert payload["caveats"] == "none"
+    assert fake_client.calls == 1
 
 
-def test_delegate_raises_malformed_after_exhausting_retry():
-    from josu.delegate.local_model import LocalModelMalformedResponseError
-
-    with pytest.raises(LocalModelMalformedResponseError):
-        delegate("summarize", client=FakeMalformedTwiceClient(), available_ram_gb=64.0)
-
-
-def test_delegate_raises_unreachable_on_connection_refused():
-    from josu.delegate.local_model import LocalModelUnreachableError
-
-    with pytest.raises(LocalModelUnreachableError):
-        delegate("summarize", client=FakeUnreachableClient(), available_ram_gb=64.0)
+@pytest.mark.asyncio
+async def test_delegate_tool_surfaces_unreachable_error_as_error_content():
+    server = build_server(client=FakeUnreachableClient())
+    async with create_connected_server_and_client_session(server) as client:
+        result = await client.call_tool("delegate_to_local", {"task": "anything"})
+        text = result.content[0].text
+        assert "error" in text.lower()
+        assert "unreachable" in text.lower()
 
 
-def test_delegate_unreachable_against_real_ollama_client_pointed_nowhere():
-    """Same error path, but through the real ollama.Client -- no fake -- pointed
-    at a host nothing is listening on, to confirm the real ConnectionError
-    surfaces through our wrapper unchanged."""
-    from josu.delegate.local_model import LocalModelUnreachableError
-
-    bad_client = ollama.Client(host="http://127.0.0.1:1", timeout=2)
-    with pytest.raises(LocalModelUnreachableError):
-        delegate("summarize", client=bad_client, available_ram_gb=64.0)
-
-
-def test_delegate_falls_back_to_file_exploration_when_graph_has_no_match(
-    built_engine, fixture_repo
-):
-    from josu.delegate.local_model import _fallback_file_context, _graph_context
-
-    # A query guaranteed not to match anything in the fixture graph.
-    context = _graph_context(built_engine, "zzz_nonexistent_symbol_zzz")
-    assert context == []
-
-    fallback = _fallback_file_context(fixture_repo)
-    assert any("helper.py" in path for path in fallback)
+@pytest.mark.asyncio
+async def test_delegate_tool_surfaces_rate_limited_error_as_error_content():
+    server = build_server(client=FakeRateLimitedClient())
+    async with create_connected_server_and_client_session(server) as client:
+        result = await client.call_tool("delegate_to_local", {"task": "anything"})
+        text = result.content[0].text
+        assert "error" in text.lower()
