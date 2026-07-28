@@ -25,7 +25,6 @@ from mcp.server.lowlevel import Server
 from josu.config.chains import ChainsConfig
 from josu.config.delegate import DelegateCandidate
 from josu.delegate import chain
-from josu.delegate.client import DelegateMalformedResponseError
 from josu.delegate.local_model import DEFAULT_TIMEOUT_SECONDS
 from josu.delegate.queue import DelegateQueue
 from josu.graph.engine import GraphEngine
@@ -129,11 +128,6 @@ def build_server(
                 )
             ]
         except chain.NoCandidatesError as exc:
-            return [types.TextContent(type="text", text=f"error: {exc}", annotations=None)]
-        except DelegateMalformedResponseError as exc:
-            # R24's same-candidate retry (inside delegate()) already ran and
-            # failed -- distinct from chain exhaustion, deliberately not
-            # unified with it (see chain.py).
             return [types.TextContent(type="text", text=f"error: {exc}", annotations=None)]
 
         payload = {

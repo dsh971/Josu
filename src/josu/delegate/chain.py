@@ -17,12 +17,20 @@ Two, deliberately separate, retry layers meet here and must stay separate:
 - R24 (same-candidate retry): a `DelegateMalformedResponseError` means the
   candidate IS reachable and functioning, it just returned garbage once.
   `local_model.py`'s `delegate()` already retries once against the SAME
-  candidate before raising that exception -- this module does not catch it
-  and does not advance the chain on it. It propagates directly out of
-  `execute_chain`, distinct from `ChainExhaustedError`, so the two retry
-  layers are never unified into one generic retry loop.
+  candidate before raising that exception -- this module never adds a
+  second retry on top of that. But once `delegate()`'s own retry is
+  exhausted and the exception reaches `execute_chain`, it is treated exactly
+  like the R34 conditions above: the candidate is unusable right now, so the
+  chain advances to the next candidate rather than failing the whole
+  delegation. The two retry layers stay distinct -- same-candidate retry
+  lives entirely inside `delegate()` and is never duplicated here -- but
+  what happens AFTER that retry is exhausted is unified with R34's
+  chain-advance behavior, per the plan's flowchart (`C -->|malformed
+  response| E[retry same candidate once]`, `E -->|still malformed| D[advance
+  to next candidate]`).
 
-When every candidate in a resolved chain is exhausted via the R34 path,
+When every candidate in a resolved chain is exhausted -- via the R34
+conditions, a malformed-response retry exhaustion, or any mix of the two --
 `execute_chain` raises `ChainExhaustedError` rather than re-raising the last
 candidate's own exception directly -- a distinguishable "the whole chain
 failed" signal (not a generic error) that U6's future run log and the MCP
@@ -48,6 +56,7 @@ from josu.config.delegate import DelegateCandidate
 from josu.delegate.client import (
     DelegateAPIError,
     DelegateClient,
+    DelegateMalformedResponseError,
     DelegateRateLimitedError,
     DelegateUnreachableError,
     OpenAICompatibleDelegateClient,
@@ -58,13 +67,16 @@ from josu.graph.engine import GraphEngine
 from josu.models.curated import preflight_check
 
 # The exception types that mean "this candidate failed, try the next one"
-# (R34) -- deliberately NOT including `DelegateMalformedResponseError`,
-# which stays R24's same-candidate-retry problem, handled entirely inside
-# `delegate()` before this module ever sees it.
+# (R34). `DelegateMalformedResponseError` IS included here: R24's
+# same-candidate retry is handled entirely inside `delegate()` before this
+# module ever sees it, but once that retry is exhausted and the exception
+# reaches this module, it advances the chain exactly like the other three --
+# see the module docstring and the plan's flowchart.
 _ADVANCE_ON: tuple[type[BaseException], ...] = (
     DelegateUnreachableError,
     DelegateRateLimitedError,
     DelegateAPIError,
+    DelegateMalformedResponseError,
     TimeoutError,
 )
 
@@ -155,11 +167,11 @@ async def execute_chain(
 ) -> DelegateResult:
     """Resolve `task_type`'s fallback chain and try each candidate in order.
 
-    Raises `NoCandidatesError` if the chain resolves empty, `ChainExhaustedError`
-    if every candidate fails via the R34 path, or a bare `DelegateMalformedResponseError`
-    if a candidate's own R24 same-candidate retry (inside `delegate()`) is exhausted --
-    that last case is deliberately NOT wrapped as chain-exhaustion and does NOT
-    advance to the next candidate (see module docstring).
+    Raises `NoCandidatesError` if the chain resolves empty, or `ChainExhaustedError`
+    if every candidate fails -- whether via the R34 conditions (unreachable,
+    rate-limited, API error), a candidate's own R24 same-candidate retry
+    (inside `delegate()`) being exhausted, or any mix of the two across the
+    chain (see module docstring).
     """
     candidates = resolve_chain(task_type, chains_config, registry)
     if not candidates:
@@ -208,11 +220,15 @@ async def execute_chain(
             except (DelegateUnreachableError, DelegateAPIError) as exc:
                 skip_records.append(SkipRecord(candidate=candidate.name, error=type(exc).__name__))
                 raise
-            # DelegateMalformedResponseError is deliberately NOT caught here.
-            # `delegate()` already ran R24's one-retry-same-candidate before
-            # raising it -- it propagates straight out of `execute_chain`,
-            # un-wrapped, rather than advancing the chain (R34) or folding
-            # into `ChainExhaustedError`.
+            except DelegateMalformedResponseError as exc:
+                # `delegate()` already ran R24's one-retry-same-candidate
+                # before raising this -- no second retry is added here. Once
+                # it reaches this point the candidate is treated as failed
+                # for chain-advance purposes, same as the R34 conditions
+                # above: recorded and re-raised so `run_chain()`'s
+                # `advance_on` handling moves on to the next candidate.
+                skip_records.append(SkipRecord(candidate=candidate.name, error=type(exc).__name__))
+                raise
 
         return _attempt
 

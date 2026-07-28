@@ -227,29 +227,97 @@ async def test_malformed_response_triggers_same_candidate_retry_not_chain_advanc
 
 
 @pytest.mark.asyncio
-async def test_malformed_response_exhausting_retry_does_not_advance_chain():
-    """When a candidate's R24 retry is ALSO exhausted, the resulting
-    `DelegateMalformedResponseError` propagates directly out of
-    `execute_chain` -- it is NOT wrapped as `ChainExhaustedError` and does
-    NOT advance to the next candidate. The two retry layers (R24 vs R34)
-    stay distinct in the code, never merged into one generic retry loop."""
+async def test_malformed_response_exhausting_retry_advances_to_next_candidate():
+    """When a candidate's R24 same-candidate retry is ALSO exhausted, the
+    chain advances to the next candidate -- exactly as it already does for
+    DelegateUnreachableError/DelegateRateLimitedError/DelegateAPIError --
+    rather than letting `DelegateMalformedResponseError` fail the whole
+    delegation. This matches the plan's flowchart (`C -->|malformed
+    response| E[retry same candidate once]`, `E -->|still malformed|
+    D[advance to next candidate]`): retry-then-fail is R24's job, entirely
+    inside `delegate()`; what happens AFTER that retry is exhausted is R34's
+    job, handled here."""
     candidates = [_candidate("always-malformed"), _candidate("good")]
     malformed_client = FakeMalformedAlwaysClient()
-    good_client = FakeGoodClient()
+    good_client = FakeGoodClient(result="42")
     clients = {"always-malformed": malformed_client, "good": good_client}
 
-    with pytest.raises(DelegateMalformedResponseError):
+    outcome = await execute_chain(
+        TASK_TYPE,
+        "anything",
+        chains_config=_chains_config(["always-malformed", "good"]),
+        registry={c.name: c for c in candidates},
+        queue=DelegateQueue(),
+        client_factory=_factory(clients),
+    )
+
+    assert outcome.result == "42"
+    assert malformed_client.calls == 2  # R24's retry, exhausted, same candidate
+    assert good_client.calls == 1  # chain advanced to the second candidate
+
+
+@pytest.mark.asyncio
+async def test_all_candidates_malformed_exhausted_raises_chain_exhausted():
+    """When EVERY candidate in the chain is malformed-exhausted (each having
+    already run R24's own same-candidate retry inside `delegate()`), the
+    result is `ChainExhaustedError` -- the same chain-exhausted surface used
+    for the unreachable/rate-limited/API-error combination, not a bare
+    `DelegateMalformedResponseError` propagating out of `execute_chain`."""
+    candidates = [_candidate("always-malformed-1"), _candidate("always-malformed-2")]
+    client_1 = FakeMalformedAlwaysClient()
+    client_2 = FakeMalformedAlwaysClient()
+    clients = {"always-malformed-1": client_1, "always-malformed-2": client_2}
+
+    with pytest.raises(ChainExhaustedError) as exc_info:
         await execute_chain(
             TASK_TYPE,
             "anything",
-            chains_config=_chains_config(["always-malformed", "good"]),
+            chains_config=_chains_config(["always-malformed-1", "always-malformed-2"]),
             registry={c.name: c for c in candidates},
             queue=DelegateQueue(),
             client_factory=_factory(clients),
         )
 
-    assert malformed_client.calls == 2  # R24's retry, exhausted
-    assert good_client.calls == 0  # chain did NOT advance on malformed
+    exc = exc_info.value
+    assert exc.task_type == TASK_TYPE
+    assert exc.attempted == ["always-malformed-1", "always-malformed-2"]
+    assert isinstance(exc.last_error, DelegateMalformedResponseError)
+    assert client_1.calls == 2  # R24's retry, exhausted
+    assert client_2.calls == 2  # R24's retry, exhausted
+    assert [r.error for r in exc.skip_records] == [
+        "DelegateMalformedResponseError",
+        "DelegateMalformedResponseError",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chain_exhausted_via_mixed_malformed_and_unreachable_failures():
+    """A chain-exhausted outcome can arise from a mix of failure modes --
+    one candidate malformed-exhausted, another unreachable -- confirming
+    the two advance paths (R24-then-R34 vs R34 directly) feed the same
+    chain-exhaustion surface rather than being handled inconsistently."""
+    candidates = [_candidate("always-malformed"), _candidate("dead")]
+    malformed_client = FakeMalformedAlwaysClient()
+    dead_client = FakeUnreachableClient()
+    clients = {"always-malformed": malformed_client, "dead": dead_client}
+
+    with pytest.raises(ChainExhaustedError) as exc_info:
+        await execute_chain(
+            TASK_TYPE,
+            "anything",
+            chains_config=_chains_config(["always-malformed", "dead"]),
+            registry={c.name: c for c in candidates},
+            queue=DelegateQueue(),
+            client_factory=_factory(clients),
+        )
+
+    exc = exc_info.value
+    assert exc.attempted == ["always-malformed", "dead"]
+    assert isinstance(exc.last_error, DelegateUnreachableError)
+    assert [r.error for r in exc.skip_records] == [
+        "DelegateMalformedResponseError",
+        "DelegateUnreachableError",
+    ]
 
 
 @pytest.mark.asyncio

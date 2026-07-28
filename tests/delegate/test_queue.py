@@ -117,8 +117,11 @@ async def test_run_chain_reraises_last_advance_on_exception_once_exhausted():
 @pytest.mark.asyncio
 async def test_run_chain_does_not_advance_on_an_exception_outside_advance_on():
     """An exception not in `advance_on` propagates immediately -- the
-    remaining attempts are never tried, mirroring how a malformed-response
-    error must not trigger a chain advance in `chain.py`."""
+    remaining attempts are never tried. `run_chain()` itself is generic
+    queueing infrastructure with no opinion on which exception types belong
+    in `advance_on`; that decision (including that a malformed-response
+    error, once `delegate()`'s own same-candidate retry is exhausted, DOES
+    belong in `advance_on`) is entirely `chain.py`'s business."""
     queue = DelegateQueue()
     second_called = False
 
