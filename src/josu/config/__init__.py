@@ -11,8 +11,12 @@ U11 composed only the delegate-candidate registry (`config/delegate.py`).
 U12 wires in `config/chains.py` (U3) alongside it, so a single `load_config()`
 call gives `daemon.py` everything it needs to construct a chain-aware
 delegate server -- the candidate roster and the fallback chains that
-reference it -- from one `josu.toml` read. `config/orchestrator.py` (U4)
-doesn't exist yet and is wired in by its own unit.
+reference it -- from one `josu.toml` read. U4 wires in
+`config/orchestrator.py`'s `[[orchestrator.adapters]]` entries alongside
+those, so the same `load_config()` call also gives the orchestrator engine
+its adapter roster -- parsed, but not yet filtered by the `mcp_approval_verified`
+attestation gate, which is a separate, deliberately-not-eager step (see that
+module's docstring) applied by callers via `usable_adapters()`.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from pathlib import Path
 
 from josu.config.chains import ChainsConfig, load_chains_config
 from josu.config.delegate import DelegateConfig, load_delegate_config
+from josu.config.orchestrator import OrchestratorConfig, load_orchestrator_config
 
 DEFAULT_CONFIG_DIRNAME = "josu"
 DEFAULT_CONFIG_FILENAME = "josu.toml"
@@ -80,6 +85,7 @@ class JosuConfig:
     path: Path
     delegate: DelegateConfig
     chains: ChainsConfig = field(default_factory=ChainsConfig)
+    orchestrator: OrchestratorConfig = field(default_factory=OrchestratorConfig)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -103,9 +109,13 @@ def load_config(path: Path | None = None, *, strict: bool = False) -> JosuConfig
     chains_config, chains_warnings = load_chains_config(data)
     warnings.extend(chains_warnings)
 
+    orchestrator_config, orchestrator_warnings = load_orchestrator_config(data)
+    warnings.extend(orchestrator_warnings)
+
     return JosuConfig(
         path=resolved,
         delegate=delegate_config,
         chains=chains_config,
+        orchestrator=orchestrator_config,
         warnings=warnings,
     )
