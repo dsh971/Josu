@@ -17,6 +17,17 @@ those, so the same `load_config()` call also gives the orchestrator engine
 its adapter roster -- parsed, but not yet filtered by the `mcp_approval_verified`
 attestation gate, which is a separate, deliberately-not-eager step (see that
 module's docstring) applied by callers via `usable_adapters()`.
+
+U5 adds `wall_clock_timeout_seconds` (R23) -- the whole-run budget
+`orchestrator/circuit_breaker.py`'s `CircuitBreaker` enforces, distinct from
+any single delegate call's own timeout. It's read directly from the raw
+TOML `[orchestrator]` table here, deliberately NOT added to
+`config/orchestrator.py`'s `OrchestratorConfig` pydantic model (that
+module's `[[orchestrator.adapters]]` array-of-tables schema is a separate
+unit's concern) -- TOML allows a table's own scalar keys to cohabit with an
+array-of-tables it also defines, so `[orchestrator]\nwall_clock_timeout_seconds
+= 1200` alongside `[[orchestrator.adapters]]` entries is valid and the two
+readers simply look at different keys of the same section.
 """
 
 from __future__ import annotations
@@ -33,6 +44,14 @@ from josu.config.orchestrator import OrchestratorConfig, load_orchestrator_confi
 
 DEFAULT_CONFIG_DIRNAME = "josu"
 DEFAULT_CONFIG_FILENAME = "josu.toml"
+
+# R23's configurable default: the whole hosted-orchestrator run (not any
+# single delegate call) is bounded by this many seconds of ACTIVE wall-clock
+# time before `orchestrator/circuit_breaker.py`'s `CircuitBreaker` trips.
+# 20 minutes is a generous default for one Claude Code turn against a
+# bounded task; override via `[orchestrator] wall_clock_timeout_seconds` in
+# `josu.toml`.
+DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS: float = 20 * 60
 
 # Bits that mean "readable/writable/executable by group or other" -- the
 # same class of bit `ssh` warns/refuses on for private key files.
@@ -86,7 +105,46 @@ class JosuConfig:
     delegate: DelegateConfig
     chains: ChainsConfig = field(default_factory=ChainsConfig)
     orchestrator: OrchestratorConfig = field(default_factory=OrchestratorConfig)
+    wall_clock_timeout_seconds: float = DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS
     warnings: list[str] = field(default_factory=list)
+
+
+def _load_wall_clock_timeout_seconds(data: dict) -> tuple[float, list[str]]:
+    """Read `[orchestrator].wall_clock_timeout_seconds` (R23) directly from
+    the raw parsed TOML -- see module docstring for why this bypasses
+    `config/orchestrator.py`'s pydantic schema entirely. Missing key falls
+    back to `DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS`, silently (that's the
+    normal, expected case, not a warning-worthy one). A present-but-invalid
+    value (non-numeric, zero, or negative) degrades to the default with a
+    warning, mirroring `config/delegate.py`/`config/chains.py`'s "a bad
+    entry degrades that entry, not the whole load" convention rather than
+    crashing config loading entirely."""
+    section = data.get("orchestrator", {})
+    if not isinstance(section, dict) or "wall_clock_timeout_seconds" not in section:
+        return DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS, []
+
+    raw_value = section["wall_clock_timeout_seconds"]
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return (
+            DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS,
+            [
+                f"orchestrator.wall_clock_timeout_seconds {raw_value!r} is not a number -- "
+                f"falling back to the default ({DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS}s)"
+            ],
+        )
+
+    if value <= 0:
+        return (
+            DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS,
+            [
+                f"orchestrator.wall_clock_timeout_seconds {value!r} must be positive -- "
+                f"falling back to the default ({DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS}s)"
+            ],
+        )
+
+    return value, []
 
 
 def load_config(path: Path | None = None, *, strict: bool = False) -> JosuConfig:
@@ -112,10 +170,14 @@ def load_config(path: Path | None = None, *, strict: bool = False) -> JosuConfig
     orchestrator_config, orchestrator_warnings = load_orchestrator_config(data)
     warnings.extend(orchestrator_warnings)
 
+    wall_clock_timeout_seconds, wall_clock_warnings = _load_wall_clock_timeout_seconds(data)
+    warnings.extend(wall_clock_warnings)
+
     return JosuConfig(
         path=resolved,
         delegate=delegate_config,
         chains=chains_config,
         orchestrator=orchestrator_config,
+        wall_clock_timeout_seconds=wall_clock_timeout_seconds,
         warnings=warnings,
     )
