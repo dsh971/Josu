@@ -1,0 +1,100 @@
+# Delegation Guide
+
+This project is driven by a hosted orchestrator (you) with a `delegate_to_local`
+MCP tool available for offloading bounded, well-defined sub-tasks to a local
+or remote delegate worker. This guide is the fuller version of the policy
+summarized in that tool's description -- read it once per session, then rely
+on the tool description's shorter reminder for the mechanical "use for X not
+Y" call.
+
+The policy here is a static, predefined guide (not a dynamic router): a
+project's `josu.toml` maps task types to a ranked fallback chain of delegate
+candidates, and this document tells you which task types are worth
+delegating in the first place. Sensible defaults are listed below; a
+project's `josu.toml` can override them, including forcing a specific task
+type to stay with you regardless of what these defaults suggest.
+
+## Delegable task types
+
+These are bounded enough that a smaller, cheaper delegate model produces a
+usable result, and any inaccuracy is easy for you to spot-check against the
+`caveats` field the tool returns:
+
+- **File/directory summarization** -- describing what a file or directory
+  contains, without needing to reason about how it fits into the wider
+  system.
+- **Boilerplate/scaffolding** -- generating code against an established,
+  already-present pattern in the codebase (a new file that mirrors an
+  existing one's shape, a new test file skeleton, config boilerplate).
+- **Simple search/extraction** -- finding and pulling out information that's
+  explicitly present in the codebase (e.g. "list every place X is imported"),
+  not synthesis or judgment calls about what's relevant.
+- **Pattern-matched test generation** -- writing tests that follow an
+  existing test file's structure and conventions for a well-understood
+  change.
+
+## Stays with you (the hosted orchestrator)
+
+Do not delegate these, even if a delegate candidate is configured and
+available:
+
+- **Complex refactors** -- anything touching multiple files where the
+  correctness of the change depends on understanding relationships across
+  the codebase, not just the local pattern of one file.
+- **Architecture decisions** -- choices that shape how future work will be
+  done, not just what one file contains right now.
+- **Ambiguous requirements** -- anything where the task itself needs
+  interpretation or clarification before it can be executed; a delegate
+  candidate can't ask a clarifying question the way you can reason through
+  ambiguity.
+- **Security-sensitive changes** -- auth, secrets handling, permission
+  checks, anything where a subtly wrong delegate output is a real risk
+  rather than a cosmetic one.
+
+A project's `josu.toml` can mark a specific task type with `stays_hosted =
+true` in its `[[delegation.chains]]` entry. When set, that task type must
+stay with you even if it would otherwise look delegable by the categories
+above, and even if candidates are listed for it in config -- this is the
+developer's explicit override of the guide's default, and it takes
+precedence over everything else in this document.
+
+## Fallback chains and free-local-first ordering
+
+Each delegable task type resolves to a ranked list of candidates, tried in
+order: free/local candidates are preferred before any paid remote one by
+default, and a remote candidate is only ever eligible at all when the
+project has explicitly opted in (`allow_remote = true` in `josu.toml`) --
+absent that flag, remote candidates are excluded from every chain regardless
+of how they're configured. You don't need to reason about this ordering
+yourself; it happens before your call reaches a candidate. What you do need
+to know is what happens when the whole chain is exhausted.
+
+## Chain-exhausted fallback
+
+If a `delegate_to_local` call returns a chain-exhausted error, every
+candidate configured for that task type was tried and none of them
+succeeded. In that case:
+
+- **Perform the sub-task yourself.** Do not retry the same delegation call
+  again -- the chain is exhausted, not rate-limited or transiently down, and
+  retrying it wastes a turn without a different outcome.
+- **Do not leave the sub-task incomplete.** The point of delegation is to
+  offload work you'd otherwise do directly; when delegation fails
+  end-to-end, fall back to doing the work directly rather than skipping it
+  or reporting it as blocked.
+
+This is the same instruction the tool description gives in short form; this
+document is the explanation of why it's the right move, not a different
+policy.
+
+## Proactive checks are a separate, local-only path
+
+Commit- and save-triggered proactive checks (re-evaluating the graph for
+issues) use a distinct `proactive_check` category that is restricted to
+local candidates by construction -- it never falls through to a remote
+candidate, even if `allow_remote` is set and even if a remote candidate is
+ranked first for other task types. If no local candidate is available when
+a proactive check would run, the check is skipped for that event rather than
+escalated to a remote candidate. You are only woken up if a proactive check
+surfaces something serious; routine proactive-check activity does not
+involve you at all.

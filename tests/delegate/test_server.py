@@ -74,6 +74,19 @@ async def test_list_tools_returns_exactly_one():
 
 
 @pytest.mark.asyncio
+async def test_tool_description_includes_chain_exhausted_fallback_instruction():
+    """U3: the tool description tells Claude Code to perform the sub-task
+    itself on a chain-exhausted error, rather than retrying the same
+    delegation or leaving it incomplete."""
+    server = build_server()
+    async with create_connected_server_and_client_session(server) as client:
+        result = await client.list_tools()
+        description = result.tools[0].description
+        assert "chain-exhausted" in description
+        assert "perform the sub-task yourself" in description
+
+
+@pytest.mark.asyncio
 async def test_delegate_bounded_task_returns_result_and_caveats(built_engine, fixture_repo):
     server = build_server(graph_engine=built_engine)
     async with create_connected_server_and_client_session(server) as client:

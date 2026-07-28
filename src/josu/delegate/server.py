@@ -32,7 +32,9 @@ _DELEGATE_DESCRIPTION = (
     "established pattern, or simple search/extraction. Do not use for complex "
     "refactors, architecture decisions, ambiguous requirements, or security-"
     "sensitive changes -- those stay with you. Returns {result, caveats}; treat "
-    "a non-empty caveats field as a signal to spot-check the result yourself."
+    "a non-empty caveats field as a signal to spot-check the result yourself. "
+    "If a call returns a chain-exhausted error, perform the sub-task yourself "
+    "rather than retrying the same delegation or leaving it incomplete."
 )
 
 
