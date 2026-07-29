@@ -34,6 +34,31 @@ def _cmd_daemon_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_log(args: argparse.Namespace) -> int:
+    from josu.observability.runlog import (
+        RunNotFoundError,
+        default_runlog_dir,
+        latest_run_id,
+        load_run,
+        render_run,
+    )
+
+    runlog_dir = Path(args.runlog_dir) if args.runlog_dir else default_runlog_dir(Path.cwd())
+    run_id = args.run_id or latest_run_id(runlog_dir)
+    if run_id is None:
+        print(f"No run log entries found under {runlog_dir}")
+        return 1
+
+    try:
+        record = load_run(run_id, runlog_dir)
+    except RunNotFoundError as exc:
+        print(str(exc))
+        return 1
+
+    print(render_run(record))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="josu")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -64,6 +89,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     start_parser.set_defaults(func=_cmd_daemon_start)
+
+    log_parser = subparsers.add_parser("log", help="Render a run's run-log record")
+    log_parser.add_argument(
+        "run_id",
+        nargs="?",
+        default=None,
+        help="Run id to render (default: the most recently started run)",
+    )
+    log_parser.add_argument(
+        "--runlog-dir",
+        default=None,
+        help="Where run-log records are stored (default: ./.josu/runlog under cwd)",
+    )
+    log_parser.set_defaults(func=_cmd_log)
 
     return parser
 
