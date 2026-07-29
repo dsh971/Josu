@@ -48,6 +48,7 @@ def build_server(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     name: str = "delegate-to-local",
     client_factory: chain.ClientFactory | None = None,
+    queue: DelegateQueue | None = None,
 ) -> Server:
     """Construct the low-level MCP server bound to the given graph engine and
     delegate-chain config.
@@ -57,9 +58,20 @@ def build_server(
     `josu.toml`) and passed in here rather than a single hardcoded model --
     empty defaults keep this constructible standalone (e.g. for
     `list_tools`-only tests) without requiring a full config.
+
+    `queue` (U14): previously always constructed locally here, trapped as a
+    variable no caller outside this function could ever reach -- which
+    meant `daemon.py`'s claim that "the daemon owns the one canonical
+    `DelegateQueue`" wasn't actually true, since nothing outside this
+    closure could share it. `daemon.py`'s `create_app()` now constructs
+    exactly one `DelegateQueue` and passes it in here AND into the new
+    `delegate/internal_api.py` route, so both the MCP tool and the internal
+    HTTP endpoint serialize through the SAME lock. A caller that doesn't
+    supply one (e.g. every existing standalone test in `test_server.py`)
+    still gets a fresh, private queue, unchanged from prior behavior.
     """
     server: Server = Server(name)
-    queue = DelegateQueue()
+    queue = queue if queue is not None else DelegateQueue()
     resolved_chains_config = chains_config if chains_config is not None else ChainsConfig()
     resolved_registry: Mapping[str, DelegateCandidate] = registry if registry is not None else {}
 

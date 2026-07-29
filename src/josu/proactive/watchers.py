@@ -540,6 +540,26 @@ def _make_executable(path: Path) -> None:
 # path), not something a standalone per-commit subprocess should
 # reconstruct on its own. A serious finding is still reported to the
 # developer, honestly, rather than silently doing nothing about it.
+#
+# U14: this subprocess used to construct its own `DelegateQueue()` and call
+# `run_proactive_check()` (-> `execute_chain()`) entirely in-process -- a
+# SECOND, unshared queue racing against the daemon's own on every commit.
+# It now calls the daemon's `/delegate/internal` endpoint instead
+# (`delegate/internal_api.py`), mirroring `delegate/client.py`'s async
+# `httpx` pattern. `run_proactive_check()` itself is UNCHANGED and still
+# used as-is by every other caller (the debounced save watcher, on-demand
+# queries, and every existing test) -- only this one subprocess entry
+# point's transport changed, not the shared composition function.
+#
+# **R39 preservation**: `_local_only_execution_inputs()` is still called
+# HERE, client-side, exactly where it always lived -- BEFORE the daemon is
+# ever contacted. The already-resolved, already-local-only candidate list
+# it produces is what gets sent (the `candidates` request shape in
+# `delegate/internal_api.py`), never a bare `task_type="proactive_check"`
+# string the daemon's real config (possibly `allow_remote=true`) would
+# resolve generally. If no local candidate exists, this returns without
+# ever contacting the daemon at all -- identical to the in-process
+# behavior it replaces.
 
 
 def _print_outcome(outcome: ProactiveCheckOutcome) -> None:
@@ -558,22 +578,65 @@ def _print_outcome(outcome: ProactiveCheckOutcome) -> None:
         )
 
 
+_COMMIT_HOOK_TASK_TEXT = "Re-evaluate the repository for issues introduced by the most recent commit."
+
+
 def _run_commit_hook_from_cli() -> int:
     import asyncio
 
+    import httpx
+
     from josu.config import load_config, resolve_config_path
+    from josu.daemon import DEFAULT_HOST, DEFAULT_PORT
+    from josu.delegate.internal_api import DELEGATE_INTERNAL_PATH
 
     config_path = resolve_config_path()
     config = load_config(config_path)
     registry = {candidate.name: candidate for candidate in config.delegate.candidates}
 
-    outcome = asyncio.run(
-        run_proactive_check(
-            "Re-evaluate the repository for issues introduced by the most recent commit.",
-            chains_config=config.chains,
-            registry=registry,
-            queue=DelegateQueue(),
+    # R39: resolve the local-only projection HERE, client-side, before ever
+    # contacting the daemon -- see the module docstring and this section's
+    # own docstring above for why this ordering is load-bearing.
+    local_chains_config, local_registry = _local_only_execution_inputs(
+        config.chains, registry
+    )
+    if local_chains_config is None:
+        _print_outcome(ProactiveCheckOutcome(skipped_no_local_candidate=True))
+        return 0
+
+    candidates = list(local_registry.values())
+    base_url = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
+
+    async def _call() -> httpx.Response:
+        async with httpx.AsyncClient(base_url=base_url, timeout=120.0) as client:
+            return await client.post(
+                DELEGATE_INTERNAL_PATH,
+                json={
+                    "task": _COMMIT_HOOK_TASK_TEXT,
+                    "candidates": [candidate.model_dump() for candidate in candidates],
+                },
+            )
+
+    try:
+        response = asyncio.run(_call())
+    except httpx.TransportError:
+        print(
+            f"josu proactive check: could not reach the josu daemon at {base_url} -- "
+            "start it with `josu daemon start`"
         )
+        return 1
+
+    payload = response.json()
+    if response.status_code >= 400:
+        print(f"josu proactive check: {payload.get('error', 'error')}: {payload.get('detail')}")
+        return 1
+
+    result = DelegateResult(
+        result=payload["result"], caveats=payload["caveats"], model=payload["model"]
+    )
+    serious = default_severity_classifier(result)
+    outcome = ProactiveCheckOutcome(
+        skipped_no_local_candidate=False, delegate_result=result, serious=serious
     )
     _print_outcome(outcome)
     return 0

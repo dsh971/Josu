@@ -28,7 +28,9 @@ from starlette.responses import Response
 from starlette.routing import Mount, Route
 
 from josu.config import JosuConfig, load_config
+from josu.delegate.internal_api import build_delegate_internal_route
 from josu.delegate.local_model import DEFAULT_TIMEOUT_SECONDS
+from josu.delegate.queue import DelegateQueue
 from josu.delegate.server import build_server as build_delegate_server
 from josu.graph.build import GraphifyEngine
 from josu.graph.server import build_server as build_graph_server
@@ -43,6 +45,7 @@ def create_app(
     config: JosuConfig | None = None,
     config_path: Path | None = None,
     delegate_timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    delegate_client_factory=None,
 ) -> Starlette:
     """Build the Starlette ASGI app mounting both MCP servers over SSE.
 
@@ -60,6 +63,23 @@ def create_app(
     The delegate server shares this same process and holds the one graph
     engine instance, so its queue (U2) is genuinely process-wide rather than
     per-worktree, and it queries the same graph the orchestrator does (R8).
+
+    U14: exactly ONE `DelegateQueue` is constructed here and shared between
+    `build_delegate_server()` (the MCP tool, `delegate_to_local`) and
+    `build_delegate_internal_route()` (the new internal HTTP endpoint used
+    by `josu delegate` and the commit hook) -- previously `build_server()`
+    constructed its own queue internally with no way for a second caller to
+    reach it, which meant "the daemon owns the one canonical queue" wasn't
+    actually true. Both entry points now serialize through this single
+    instance's lock.
+
+    `delegate_client_factory` (U14 test seam): threaded into both the MCP
+    tool and the internal route, mirroring `build_delegate_server()`'s own
+    existing `client_factory` parameter -- lets tests inject a fake
+    `DelegateClient` (e.g. to prove a candidate is never contacted) for a
+    daemon started through this same production entry point, without
+    reaching over the network. `None` (the default) preserves existing
+    production behavior unchanged.
     """
     if config is None:
         config = load_config(config_path)
@@ -71,13 +91,32 @@ def create_app(
     graph_sse = SseServerTransport("/graph/messages/")
 
     registry = {candidate.name: candidate for candidate in config.delegate.candidates}
+    delegate_queue = DelegateQueue()
     delegate_server = build_delegate_server(
         graph_engine=engine,
         chains_config=config.chains,
         registry=registry,
         timeout=delegate_timeout,
+        queue=delegate_queue,
+        client_factory=delegate_client_factory,
     )
     delegate_sse = SseServerTransport("/delegate/messages/")
+
+    # U14: the internal route shares `delegate_queue`, `config.chains`, and
+    # `registry` with the MCP tool above -- see this module's and
+    # `delegate/internal_api.py`'s docstrings for the queue-sharing
+    # rationale and the deliberate loopback-TCP-vs-UDS trust-boundary
+    # decision (mounted into this same app/port, not a separate UDS
+    # listener, given `run()`'s current single-blocking-`uvicorn.run()`
+    # structure).
+    internal_delegate_route = build_delegate_internal_route(
+        queue=delegate_queue,
+        chains_config=config.chains,
+        registry=registry,
+        graph_engine=engine,
+        timeout=delegate_timeout,
+        client_factory=delegate_client_factory,
+    )
 
     async def handle_graph_sse(request):
         async with graph_sse.connect_sse(
@@ -102,6 +141,7 @@ def create_app(
         Mount("/graph/messages/", app=graph_sse.handle_post_message),
         Route("/delegate/sse", endpoint=handle_delegate_sse, methods=["GET"]),
         Mount("/delegate/messages/", app=delegate_sse.handle_post_message),
+        internal_delegate_route,
     ]
     return Starlette(routes=routes)
 

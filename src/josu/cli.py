@@ -305,44 +305,69 @@ def _cmd_log(args: argparse.Namespace) -> int:
 
 def _cmd_delegate(args: argparse.Namespace) -> int:
     """U7's direct-request escape hatch: route a bounded `task_type` straight
-    to the local delegate worker via `fallback/quota.py`'s
-    `route_bounded_request()` -- no daemon, no worktree, no Claude Code
-    invocation involved. Meant for a developer to invoke by hand once
-    they've noticed (via `josu log`, or Claude Code simply refusing to run)
-    that Claude Code is quota/rate-limit exhausted.
+    to the local delegate worker. Meant for a developer to invoke by hand
+    once they've noticed (via `josu log`, or Claude Code simply refusing to
+    run) that Claude Code is quota/rate-limit exhausted.
+
+    U14: this no longer constructs its own `DelegateQueue`/calls
+    `delegate/chain.py`'s `execute_chain()` directly -- that was a SECOND,
+    unshared queue living in this CLI process, independent of the daemon's
+    own, defeating the "one shared queue serializes every delegate call"
+    invariant. Instead this is now an `httpx` client of the daemon's
+    `/delegate/internal` endpoint (`delegate/internal_api.py`), mirroring
+    `delegate/client.py`'s async-client pattern applied to an internal call.
+    If the daemon isn't reachable, this fails with a clear, actionable
+    message -- never a stack trace, and never a silent fallback to a local
+    queue (that fallback would silently reintroduce the exact bug this unit
+    fixes).
+
+    R28/R29's bounded-task-type gate (`fallback/quota.py`'s
+    `TaskNotBoundedError`) is still enforced here, client-side, before any
+    network call is made -- a non-bounded `task_type` is refused
+    immediately rather than round-tripping to the daemon for nothing.
     """
     import asyncio
 
-    from josu.config import load_config
-    from josu.delegate.chain import ChainExhaustedError, NoCandidatesError
-    from josu.delegate.queue import DelegateQueue
-    from josu.fallback.quota import TaskNotBoundedError, route_bounded_request
+    import httpx
 
-    config_path = Path(args.config) if args.config else resolve_config_path()
-    config = load_config(config_path)
-    registry = {candidate.name: candidate for candidate in config.delegate.candidates}
+    from josu.config.chains import DELEGABLE_TASK_TYPES
+    from josu.daemon import DEFAULT_HOST, DEFAULT_PORT
+    from josu.delegate.internal_api import DELEGATE_INTERNAL_PATH
+    from josu.fallback.quota import HOSTED_PAUSED_NOTICE, TaskNotBoundedError
+
+    if args.task_type not in DELEGABLE_TASK_TYPES:
+        print(str(TaskNotBoundedError(args.task_type)))
+        return 1
+
+    host = args.host or DEFAULT_HOST
+    port = args.port or DEFAULT_PORT
+    base_url = f"http://{host}:{port}"
+
+    async def _call() -> httpx.Response:
+        async with httpx.AsyncClient(base_url=base_url, timeout=120.0) as client:
+            return await client.post(
+                DELEGATE_INTERNAL_PATH,
+                json={"task_type": args.task_type, "task": args.task},
+            )
 
     try:
-        outcome = asyncio.run(
-            route_bounded_request(
-                args.task_type,
-                args.task,
-                chains_config=config.chains,
-                registry=registry,
-                queue=DelegateQueue(),
-            )
+        response = asyncio.run(_call())
+    except httpx.TransportError:
+        print(
+            f"josu delegate: could not reach the josu daemon at {base_url} -- "
+            "start it with `josu daemon start`"
         )
-    except TaskNotBoundedError as exc:
-        print(str(exc))
-        return 1
-    except (NoCandidatesError, ChainExhaustedError) as exc:
-        print(str(exc))
         return 1
 
-    print(outcome.message)
-    print(outcome.delegate_result.result)
-    if outcome.delegate_result.caveats:
-        print(f"caveats: {outcome.delegate_result.caveats}")
+    payload = response.json()
+    if response.status_code >= 400:
+        print(f"josu delegate: {payload.get('error', 'error')}: {payload.get('detail')}")
+        return 1
+
+    print(HOSTED_PAUSED_NOTICE)
+    print(payload["result"])
+    if payload.get("caveats"):
+        print(f"caveats: {payload['caveats']}")
     return 0
 
 
@@ -482,8 +507,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Path to josu.toml (candidate/chain config). Defaults to the "
-            "XDG-style location config/__init__.py resolves."
+            "XDG-style location config/__init__.py resolves. Unused directly "
+            "by this command (U14: the daemon, not this CLI process, loads "
+            "config) -- kept for CLI compatibility."
         ),
+    )
+    delegate_parser.add_argument(
+        "--host",
+        default=None,
+        help=f"josu daemon host to connect to (default: {DEFAULT_HOST})",
+    )
+    delegate_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=f"josu daemon port to connect to (default: {DEFAULT_PORT})",
     )
     delegate_parser.set_defaults(func=_cmd_delegate)
 
