@@ -21,6 +21,7 @@ single argument. See `test_adapter.py`'s injection-safety test.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -56,6 +57,21 @@ class PathEscapesWorktreeError(RuntimeError):
     """Raised when a path the invoked CLI claims to have read or edited does
     not resolve under the worktree root -- the wrapper's own check, applied
     independent of whatever the CLI itself reported."""
+
+
+class McpApprovalNotVerifiedError(RuntimeError):
+    """Raised when an adapter's `mcp_approval_verified.verified` is not
+    `True`, checked here -- immediately before invocation -- rather than
+    only in `config/orchestrator.py`'s `usable_adapters()`.
+
+    `usable_adapters()` is a convenience filter for callers that want a
+    pre-screened list; it is not on the actual invocation path (`run()` in
+    `adapters/claude_code.py` calls `invoke_adapter()` directly, never
+    `usable_adapters()`), so relying on it alone would mean R37's gate is
+    enforced only for callers that happen to filter through it first. This
+    check makes the gate unconditional: it fires here even if a caller
+    bypasses `usable_adapters()` entirely and hands an unverified adapter
+    straight to `invoke_adapter()`."""
 
 
 @dataclass(frozen=True)
@@ -112,6 +128,42 @@ def build_argv(
     return [adapter.command, *(arg.format(**substitutions) for arg in adapter.args)]
 
 
+def _check_mcp_approval_verified(adapter: OrchestratorAdapterConfig) -> None:
+    if not adapter.mcp_approval_verified.verified:
+        raise McpApprovalNotVerifiedError(
+            f"adapter {adapter.name!r}: mcp_approval_verified.verified is not True -- "
+            "refusing to invoke (R37); usable_adapters() is a convenience filter, not "
+            "an enforcement point, so this is checked again here, immediately before "
+            "any subprocess is spawned"
+        )
+
+
+def _build_subprocess_env(forbidden_env_names: Iterable[str] = ()) -> dict[str, str]:
+    """Build the environment passed to the spawned adapter subprocess.
+
+    Starts from a copy of THIS process's own environment -- the invoked CLI
+    (Claude Code) needs at minimum `PATH` (to find its own runtime/
+    dependencies) and `HOME` (to locate its own credentials/config) to run
+    at all, and the full safe allowlist of every variable the `claude` CLI
+    might legitimately read isn't confidently enumerable here -- then
+    explicitly deletes every name in `forbidden_env_names`.
+
+    Callers are expected to supply every configured delegate candidate's
+    `api_key_env` name (see `adapters/claude_code.py`'s `run()` /
+    `_forbidden_env_names()`, which sources these from the loaded
+    `DelegateConfig`): those are exactly the resolved remote-delegate
+    credentials the daemon process may hold in its own environment that a
+    spawned Claude Code subprocess has no legitimate need for. This is a
+    documented minimum -- excluding known delegate-credential env var names
+    -- not a full safe-allowlist; any other sensitive variable not
+    identified this way is NOT scrubbed by this function.
+    """
+    env = dict(os.environ)
+    for name in forbidden_env_names:
+        env.pop(name, None)
+    return env
+
+
 def invoke_adapter(
     adapter: OrchestratorAdapterConfig,
     *,
@@ -119,15 +171,24 @@ def invoke_adapter(
     mcp_config: Path,
     task: str,
     timeout: float | None = None,
+    forbidden_env_names: Iterable[str] = (),
 ) -> InvocationResult:
     """Build the argv for `adapter` and run it via `subprocess.run(shell=False)`.
 
     Order of checks, all before any subprocess is spawned:
     1. `command` allowlist (defense in depth; also checked at config-load time).
-    2. Build the argv (per-argument substitution, never a shell string).
-    3. Forbidden-flag check (R19/R22) against the fully-built argv.
+    2. `mcp_approval_verified.verified` gate (R37) -- enforced here, at the
+       point of actual invocation, not just in `usable_adapters()`.
+    3. Build the argv (per-argument substitution, never a shell string).
+    4. Forbidden-flag check (R19/R22) against the fully-built argv.
+
+    The spawned subprocess's environment is an explicit, scrubbed copy (see
+    `_build_subprocess_env()`) -- never the bare, unfiltered parent
+    environment -- so `forbidden_env_names` (typically delegate-candidate
+    `api_key_env` names) never reaches the invoked CLI.
     """
     _check_command_allowlisted(adapter.command)
+    _check_mcp_approval_verified(adapter)
     argv = build_argv(adapter, worktree=worktree, mcp_config=mcp_config, task=task)
     _forbid_bypass_flags(argv)
 
@@ -138,6 +199,7 @@ def invoke_adapter(
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=_build_subprocess_env(forbidden_env_names),
     )
     return InvocationResult(
         argv=argv, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr

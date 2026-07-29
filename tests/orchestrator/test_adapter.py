@@ -11,6 +11,7 @@ convention.
 from __future__ import annotations
 
 import json
+import os
 from datetime import date
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from josu.config.orchestrator import McpApprovalVerified, OrchestratorAdapterCon
 from josu.orchestrator.adapter import (
     DisallowedCommandError,
     ForbiddenFlagError,
+    McpApprovalNotVerifiedError,
     PathEscapesWorktreeError,
     assert_paths_within_worktree,
     build_argv,
@@ -174,6 +176,87 @@ def test_invoke_adapter_rechecks_command_allowlist():
     )
     with pytest.raises(DisallowedCommandError):
         invoke_adapter(adapter, worktree=Path("/tmp"), mcp_config=Path("/tmp/m.json"), task="x")
+
+
+# --- mcp_approval_verified gate (R37), enforced at invocation time ----------
+
+
+def test_invoke_adapter_refuses_invocation_when_mcp_approval_not_verified(tmp_path):
+    """Covers the P1 fix: `mcp_approval_verified.verified = False` is
+    refused directly by `invoke_adapter()`, even when called without ever
+    going through `config/orchestrator.py`'s `usable_adapters()` -- proving
+    the gate is enforced at the actual point of invocation, not only in a
+    convenience listing function nothing on the invocation path calls. No
+    `fake_claude_bin` is installed, so a `FileNotFoundError` from an actual
+    spawn attempt (rather than `McpApprovalNotVerifiedError`) would mean the
+    check ran too late, after already trying to spawn a subprocess."""
+    adapter = _adapter(
+        mcp_approval_verified=McpApprovalVerified(verified=False, verified_date=date(2026, 1, 1))
+    )
+    with pytest.raises(McpApprovalNotVerifiedError):
+        invoke_adapter(adapter, worktree=tmp_path, mcp_config=tmp_path / "m.json", task="task")
+
+
+# --- Subprocess environment scrubbing (R31-adjacent) -------------------------
+
+
+def test_invoke_adapter_scrubs_forbidden_env_names_from_the_spawned_subprocess(
+    fake_claude_bin, tmp_path, monkeypatch
+):
+    """Covers the P1 fix: `invoke_adapter()`'s subprocess.run() call now
+    passes an explicit `env=`, scrubbed of `forbidden_env_names` -- proving
+    a fake delegate-credential env var set in the test process does NOT
+    appear in the env actually received by the spawned subprocess (captured
+    via the real fake `claude` binary dumping its own `os.environ`, not a
+    mock of `subprocess.run`), while an unrelated var (PATH) still does."""
+    monkeypatch.setenv("FAKE_DELEGATE_API_KEY", "sk-should-never-reach-the-subprocess")
+
+    env_dump_file = tmp_path / "env.json"
+    monkeypatch.setenv("FAKE_CLAUDE_ENV_DUMP_FILE", str(env_dump_file))
+    monkeypatch.setenv("FAKE_CLAUDE_STDOUT_FILE", "")
+    monkeypatch.setenv("FAKE_CLAUDE_EXIT_CODE", "0")
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    adapter = _adapter()
+    result = invoke_adapter(
+        adapter,
+        worktree=worktree,
+        mcp_config=tmp_path / "m.json",
+        task="task",
+        forbidden_env_names=["FAKE_DELEGATE_API_KEY"],
+    )
+
+    assert result.returncode == 0
+    received_env = json.loads(env_dump_file.read_text(encoding="utf-8"))
+    assert "FAKE_DELEGATE_API_KEY" not in received_env
+    # Sanity: the scrub is targeted, not a wholesale env wipe -- PATH (needed
+    # to find/run anything at all) is still present.
+    assert received_env.get("PATH") == os.environ["PATH"]
+
+
+def test_invoke_adapter_with_no_forbidden_names_behaves_like_full_env_passthrough(
+    fake_claude_bin, tmp_path, monkeypatch
+):
+    """Covers: the default (`forbidden_env_names=()`) still passes an
+    explicit `env=` copy of the parent environment -- not an empty one --
+    so existing callers that don't yet supply delegate-credential names see
+    unchanged behavior (full inherit) rather than a broken/empty environment."""
+    monkeypatch.setenv("SOME_UNRELATED_VAR", "still-here")
+    env_dump_file = tmp_path / "env.json"
+    monkeypatch.setenv("FAKE_CLAUDE_ENV_DUMP_FILE", str(env_dump_file))
+    monkeypatch.setenv("FAKE_CLAUDE_STDOUT_FILE", "")
+    monkeypatch.setenv("FAKE_CLAUDE_EXIT_CODE", "0")
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    adapter = _adapter()
+    invoke_adapter(adapter, worktree=worktree, mcp_config=tmp_path / "m.json", task="task")
+
+    received_env = json.loads(env_dump_file.read_text(encoding="utf-8"))
+    assert received_env.get("SOME_UNRELATED_VAR") == "still-here"
 
 
 # --- Path-within-worktree wrapper check -------------------------------------

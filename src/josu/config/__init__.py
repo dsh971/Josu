@@ -154,8 +154,29 @@ def load_config(path: Path | None = None, *, strict: bool = False) -> JosuConfig
     Permission and env-var-existence problems become warnings on `config`
     (never raised) unless `strict=True`, in which case a permission problem
     refuses to load at all.
+
+    If the resolved path doesn't exist -- the expected state on a first run,
+    before anyone has ever created `josu.toml` -- this returns a usable
+    default `JosuConfig` (no delegate candidates, chains, or orchestrator
+    adapters configured) with a warning recorded, rather than letting
+    `Path.open()`'s `FileNotFoundError` propagate and crash every CLI/daemon
+    entry point that calls this before any config file has ever been
+    created. Permission checks and TOML parsing are both skipped in this
+    case -- there's nothing on disk to stat or parse.
     """
     resolved = path if path is not None else resolve_config_path()
+
+    if not resolved.exists():
+        return JosuConfig(
+            path=resolved,
+            delegate=DelegateConfig(),
+            warnings=[
+                f"{resolved} does not exist -- using a default config with no delegate "
+                "candidates, chains, or orchestrator adapters configured; create this "
+                "file to configure josu"
+            ],
+        )
+
     warnings = check_permissions(resolved, strict=strict)
 
     with resolved.open("rb") as f:

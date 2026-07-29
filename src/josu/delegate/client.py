@@ -168,3 +168,14 @@ class OpenAICompatibleDelegateClient:
             raise DelegateMalformedResponseError(
                 self._name, "response body is not a parseable chat-completion shape"
             ) from exc
+        except RecursionError as exc:
+            # A deeply (but not necessarily large-byte-wise) nested response
+            # body -- e.g. thousands of levels of nested arrays/objects --
+            # blows CPython's recursion limit inside `json.loads`'s
+            # recursive-descent parser before ever raising `JSONDecodeError`.
+            # Treated as exactly the same "malformed response" outcome as
+            # any other unparseable body, not an uncaught crash that bypasses
+            # R24's same-candidate retry / R34's chain-advance handling.
+            raise DelegateMalformedResponseError(
+                self._name, "response body is too deeply nested to parse"
+            ) from exc

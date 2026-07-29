@@ -134,6 +134,49 @@ class OrchestratorConfig(BaseModel):
     adapters: list[OrchestratorAdapterConfig] = []
 
 
+def _args_scoping_problem(args: list[str]) -> str | None:
+    """Check whether `args` actually restricts Claude Code's tool access.
+
+    A custom `[[orchestrator.adapters]]` TOML entry's `args` is otherwise
+    free-form text: `command`/`structured_output_mode` are checked against
+    an allowlist above, but nothing previously stopped an entry like
+    `args = ["-p", "{task}"]` (no `--strict-mcp-config`, no `--allowedTools`)
+    from validating successfully -- which would grant Claude Code
+    unrestricted tool access if actually invoked. This is checked at
+    config-load time, at the same "reject this entry, warn, keep loading"
+    granularity as the command/output-mode gates, against the known-good
+    shape `adapters/claude_code.py`'s own `ADAPTER_ARGS_TEMPLATE` uses:
+    `--strict-mcp-config <manifest>` and `--allowedTools <non-empty list>`.
+
+    Returns `None` if `args` scopes tool access adequately, otherwise a
+    human-readable reason string suitable for inclusion in a load-time
+    warning.
+
+    Deliberately a plain function consulted by the loader below, not a
+    pydantic `field_validator` on `OrchestratorAdapterConfig` itself --
+    several other modules (`orchestrator/adapter.py`'s and `adapters/
+    claude_code.py`'s own test suites, plus hand-authored configs like
+    `build_default_adapter_config()`) construct `OrchestratorAdapterConfig`
+    directly, for adapters that are either already known-good or under
+    test for something unrelated to args-scoping. Only entries that
+    actually go through `load_orchestrator_config()` -- i.e. real
+    `[[orchestrator.adapters]]` TOML entries -- are held to this gate,
+    mirroring where `mcp_approval_verified` staleness is also a
+    loader-level (not schema-level) concern.
+    """
+    if "--strict-mcp-config" not in args:
+        return "args does not include --strict-mcp-config"
+
+    if "--allowedTools" not in args:
+        return "args does not include --allowedTools"
+
+    index = args.index("--allowedTools")
+    if index + 1 >= len(args) or not args[index + 1].strip():
+        return "--allowedTools is not followed by a non-empty value"
+
+    return None
+
+
 def load_orchestrator_config(data: dict[str, Any]) -> tuple[OrchestratorConfig, list[str]]:
     """Validate the `[[orchestrator.adapters]]` entries of an already-parsed
     TOML document.
@@ -141,9 +184,10 @@ def load_orchestrator_config(data: dict[str, Any]) -> tuple[OrchestratorConfig, 
     Each entry is validated independently -- unlike a plain
     `OrchestratorConfig.model_validate(section)` (which would fail the whole
     list on one bad entry), a single malformed entry (off-allowlist command,
-    undeclarable output mode, or any other schema violation) is excluded and
-    recorded as a warning, mirroring `config/delegate.py`/`config/chains.py`'s
-    "a bad entry degrades that entry, not the whole load" convention.
+    undeclarable output mode, args that don't scope tool access, or any
+    other schema violation) is excluded and recorded as a warning, mirroring
+    `config/delegate.py`/`config/chains.py`'s "a bad entry degrades that
+    entry, not the whole load" convention.
 
     Returns `(config, warnings)` -- `warnings` never crashes config loading.
     """
@@ -161,6 +205,17 @@ def load_orchestrator_config(data: dict[str, Any]) -> tuple[OrchestratorConfig, 
                 f"orchestrator adapter {entry_name!r} rejected at load time: {exc}"
             )
             continue
+
+        scoping_problem = _args_scoping_problem(adapter.args)
+        if scoping_problem is not None:
+            warnings.append(
+                f"orchestrator adapter {entry_name!r} rejected at load time: args does "
+                f"not adequately restrict Claude Code's tool access ({scoping_problem}) "
+                "-- an adapter entry whose args don't include --strict-mcp-config and a "
+                "non-empty --allowedTools would grant unrestricted tool access if invoked"
+            )
+            continue
+
         parsed.append(adapter)
 
     return OrchestratorConfig(adapters=parsed), warnings

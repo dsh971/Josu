@@ -23,7 +23,9 @@ import pytest
 # write the received argv to, as JSON -- proves exactly what argv the real
 # subprocess boundary received), FAKE_CLAUDE_STDOUT_FILE (a file whose
 # contents are echoed verbatim to stdout, i.e. a canned stream-json fixture),
-# and FAKE_CLAUDE_EXIT_CODE (defaults to 0).
+# FAKE_CLAUDE_ENV_DUMP_FILE (path to write the received environment to, as
+# JSON -- proves exactly what env the real subprocess boundary received, for
+# the env-scrubbing test), and FAKE_CLAUDE_EXIT_CODE (defaults to 0).
 _FAKE_CLAUDE_SCRIPT = """#!/usr/bin/env python3
 import json
 import os
@@ -35,6 +37,11 @@ def main():
     if argv_log:
         with open(argv_log, "w", encoding="utf-8") as f:
             json.dump(sys.argv, f)
+
+    env_dump = os.environ.get("FAKE_CLAUDE_ENV_DUMP_FILE")
+    if env_dump:
+        with open(env_dump, "w", encoding="utf-8") as f:
+            json.dump(dict(os.environ), f)
 
     stdout_file = os.environ.get("FAKE_CLAUDE_STDOUT_FILE")
     if stdout_file and os.path.exists(stdout_file):

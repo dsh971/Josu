@@ -180,6 +180,14 @@ async def delegate(
             return _parse_response(content)
         except (json.JSONDecodeError, KeyError, TypeError):
             return None
+        except RecursionError:
+            # `content` itself (the model's own {result, caveats} envelope)
+            # can independently be deeply nested JSON, even when the
+            # outer HTTP response body parsed fine at the client layer --
+            # same malformed-response treatment as a JSONDecodeError/KeyError
+            # here, feeding the same retry-once-then-raise path (R24) rather
+            # than crashing past it.
+            return None
 
     parsed = await _attempt()
     if parsed is None:

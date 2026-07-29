@@ -123,6 +123,25 @@ def test_load_config_composes_chains_alongside_delegate_candidates(tmp_path):
     assert config.chains.chains[0].task_type == "file_summarization"
 
 
+def test_load_config_returns_default_config_with_warning_when_path_does_not_exist(tmp_path):
+    """Covers the P1 fix: `load_config()` against a `josu.toml` path that
+    doesn't exist yet (the expected state on a first run, before anyone has
+    created the file) must return a usable default `JosuConfig` with a
+    warning recorded -- not raise `FileNotFoundError` and crash every
+    CLI/daemon entry point that calls this before a config file exists."""
+    nonexistent = tmp_path / "does" / "not" / "exist" / "josu.toml"
+
+    config = load_config(nonexistent)
+
+    assert config.path == nonexistent
+    assert config.delegate.candidates == []
+    assert config.chains.chains == []
+    assert config.orchestrator.adapters == []
+    assert len(config.warnings) == 1
+    assert str(nonexistent) in config.warnings[0]
+    assert "does not exist" in config.warnings[0]
+
+
 def test_load_config_defaults_chains_empty_when_no_delegation_section(tmp_path):
     config_path = tmp_path / "josu.toml"
     _write_toml(config_path)

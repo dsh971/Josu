@@ -36,7 +36,7 @@ _VALID_CLAUDE_ADAPTER_TOML = """
 [[orchestrator.adapters]]
 name = "claude-code"
 command = "claude"
-args = ["-p", "--strict-mcp-config", "{mcp_config}", "{task}"]
+args = ["-p", "--strict-mcp-config", "{mcp_config}", "--allowedTools", "Read({worktree}/**)", "{task}"]
 structured_output_mode = "stream-json"
 field_mapping = { result = "result" }
 mcp_approval_verified = { verified = true, verified_date = 2026-01-01 }
@@ -101,11 +101,12 @@ def test_off_allowlist_command_rejected_directly_via_pydantic_validation():
         )
 
 
-def test_verified_false_adapter_excluded_from_usable_list(tmp_path):
-    """Covers: a second adapter config entry with mcp_approval_verified.verified
-    = false is not offered as usable, even if its command template is
-    otherwise complete."""
-    toml_text = """
+# A minimal, "-p"/"{task}"-only args shape -- no --strict-mcp-config, no
+# --allowedTools -- is exactly the vulnerability this gate closes: it would
+# grant Claude Code unrestricted tool access if actually invoked. This used
+# to be accepted by load_orchestrator_config() with zero warnings (the bug);
+# it must now be rejected at load time instead.
+_UNSCOPED_ARGS_ADAPTER_TOML = """
 [[orchestrator.adapters]]
 name = "claude-code"
 command = "claude"
@@ -117,6 +118,65 @@ mcp_approval_verified = { verified = true, verified_date = 2026-01-01 }
 name = "claude-code-unverified"
 command = "claude"
 args = ["-p", "{task}"]
+structured_output_mode = "stream-json"
+mcp_approval_verified = { verified = false, verified_date = 2026-01-01 }
+"""
+
+
+def test_unscoped_adapter_args_rejected_at_load_time_even_with_valid_attestation(tmp_path):
+    """Covers the P0 gap: an adapter entry whose `args` doesn't include
+    --strict-mcp-config and a non-empty --allowedTools value is rejected at
+    config-load time, independent of whether its mcp_approval_verified
+    attestation is otherwise complete (the first entry here is fully
+    verified=true and still rejected on args alone)."""
+    data = _parse(_UNSCOPED_ARGS_ADAPTER_TOML, tmp_path)
+    config, warnings = load_orchestrator_config(data)
+
+    assert config.adapters == []
+    assert len(warnings) == 2
+    # args=["-p", "{task}"] is missing --strict-mcp-config first (checked
+    # before --allowedTools), so both entries' warnings name that.
+    assert any("claude-code-unverified" not in w and "claude-code" in w and "strict-mcp-config" in w for w in warnings)
+    assert any("claude-code-unverified" in w and "strict-mcp-config" in w for w in warnings)
+
+
+def test_properly_scoped_adapter_entry_still_validates(tmp_path):
+    """Covers: an adapter entry whose args DO include --strict-mcp-config
+    and a non-empty --allowedTools value still parses and loads successfully
+    -- the gate only rejects unscoped entries, not every custom entry."""
+    toml_text = """
+[[orchestrator.adapters]]
+name = "claude-code-scoped"
+command = "claude"
+args = ["-p", "--strict-mcp-config", "{mcp_config}", "--allowedTools", "Read({worktree}/**)", "{task}"]
+structured_output_mode = "stream-json"
+mcp_approval_verified = { verified = true, verified_date = 2026-01-01 }
+"""
+    data = _parse(toml_text, tmp_path)
+    config, warnings = load_orchestrator_config(data)
+
+    assert warnings == []
+    assert [a.name for a in config.adapters] == ["claude-code-scoped"]
+
+
+def test_verified_false_adapter_excluded_from_usable_list(tmp_path):
+    """Covers: a second adapter config entry with mcp_approval_verified.verified
+    = false is not offered as usable, even if its command template is
+    otherwise complete. Uses properly-scoped args throughout so this test
+    exercises the verified=false exclusion in isolation from the
+    args-scoping gate covered separately above."""
+    toml_text = """
+[[orchestrator.adapters]]
+name = "claude-code"
+command = "claude"
+args = ["-p", "--strict-mcp-config", "{mcp_config}", "--allowedTools", "Read({worktree}/**)", "{task}"]
+structured_output_mode = "stream-json"
+mcp_approval_verified = { verified = true, verified_date = 2026-01-01 }
+
+[[orchestrator.adapters]]
+name = "claude-code-unverified"
+command = "claude"
+args = ["-p", "--strict-mcp-config", "{mcp_config}", "--allowedTools", "Read({worktree}/**)", "{task}"]
 structured_output_mode = "stream-json"
 mcp_approval_verified = { verified = false, verified_date = 2026-01-01 }
 """
@@ -140,7 +200,7 @@ def test_stale_verified_date_warns_but_stays_usable(tmp_path):
 [[orchestrator.adapters]]
 name = "claude-code"
 command = "claude"
-args = ["-p", "{{task}}"]
+args = ["-p", "--strict-mcp-config", "{{mcp_config}}", "--allowedTools", "Read({{worktree}}/**)", "{{task}}"]
 structured_output_mode = "stream-json"
 mcp_approval_verified = {{ verified = true, verified_date = {stale_date.isoformat()} }}
 """
@@ -213,7 +273,7 @@ def test_one_bad_adapter_entry_does_not_crash_the_whole_load(tmp_path):
 [[orchestrator.adapters]]
 name = "good-claude"
 command = "claude"
-args = ["-p", "{task}"]
+args = ["-p", "--strict-mcp-config", "{mcp_config}", "--allowedTools", "Read({worktree}/**)", "{task}"]
 structured_output_mode = "stream-json"
 mcp_approval_verified = { verified = true, verified_date = 2026-01-01 }
 

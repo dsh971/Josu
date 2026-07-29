@@ -233,13 +233,30 @@ def test_allowed_git_commands_pass(command):
         "git commit -m done && git push",
         "git commit -m done | cat",
         "git add . ; git push origin main",
+        "git commit -m x > ~/.ssh/authorized_keys",
+        "git commit -m x >> ~/.ssh/authorized_keys",
+        "git log < ~/.ssh/id_rsa",
+        "git diff > /tmp/leak.txt",
     ],
 )
 def test_forbidden_git_commands_are_rejected(command):
     """Covers: the git allowlist never includes push, reset, clean, worktree,
     or config/-c; a simulated `git config alias.x '!<cmd>'` attempt is
-    rejected by the allowlist."""
+    rejected by the allowlist; and output-redirection operators (`>`, `>>`,
+    `<`) -- e.g. `git commit -m x > ~/.ssh/authorized_keys` -- are rejected
+    by the shell-metacharacter backstop even though `git commit` itself is
+    on the allowlist."""
     assert is_git_subcommand_allowed(command) is False
+
+
+def test_git_command_with_output_redirection_is_rejected_even_though_subcommand_is_allowed():
+    """Explicit regression coverage for the P0 fix: `_SHELL_METACHARACTERS`
+    previously omitted `>`, `>>`, and `<`, so an allowed subcommand (`git
+    commit`) combined with output redirection (writing over a sensitive
+    file, or reading one in as input) would have passed this check."""
+    assert is_git_subcommand_allowed("git commit -m x > ~/.ssh/authorized_keys") is False
+    assert is_git_subcommand_allowed("git commit -m x >> ~/.ssh/authorized_keys") is False
+    assert is_git_subcommand_allowed("git diff < ~/.ssh/id_rsa") is False
 
 
 def test_git_alias_escape_attempt_is_rejected_even_though_it_looks_like_config():
@@ -367,6 +384,44 @@ def test_run_raises_when_system_init_does_not_confirm_both_servers(
             manifest=manifest,
             config_path=tmp_path / "unrelated-josu.toml",
             task="do something",
+        )
+
+
+def test_run_surfaces_git_allowlist_violation_even_when_mcp_connectivity_also_fails(
+    fake_claude_bin, git_repo, tmp_path, monkeypatch
+):
+    """Covers the P1 reorder fix: a run that both (a) recorded a
+    disallowed git Bash call and (b) failed to confirm both required MCP
+    servers connected must surface the security violation
+    (GitAllowlistViolationError), not have it silently short-circuited past
+    by the unrelated MCPServerConnectionError raising first. Before the
+    fix, `after_validated` (which runs the git-allowlist/paths/config-staged
+    checks) only ran after `assert_both_mcp_servers_connected()` passed, so
+    this scenario would have raised MCPServerConnectionError instead,
+    masking the fact that something unsafe also happened in the worktree."""
+    worktree = create_worktree(git_repo, tmp_path / "worktrees")
+    manifest = write_manifest(worktree.path, "127.0.0.1", 8765)
+
+    stdout_file = tmp_path / "stdout.jsonl"
+    stdout_file.write_text(
+        _jsonl(
+            # MCP connectivity fails (delegate server not connected)...
+            _init_event(delegate_connected=False),
+            # ...AND an unsafe git command was recorded.
+            _bash_event("git push origin main"),
+            _result_event(),
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FAKE_CLAUDE_STDOUT_FILE", str(stdout_file))
+
+    with pytest.raises(GitAllowlistViolationError):
+        run(
+            _adapter_config(),
+            worktree=worktree,
+            manifest=manifest,
+            config_path=tmp_path / "unrelated-josu.toml",
+            task="do something unsafe while MCP also fails to connect",
         )
 
 

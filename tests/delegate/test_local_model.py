@@ -85,6 +85,22 @@ class FakeEnvelopeMalformedThenGoodClient:
         return json.dumps({"result": "ok", "caveats": ""})
 
 
+class FakeDeeplyNestedContentClient:
+    """Fake `DelegateClient` whose `content` (the model's own {result,
+    caveats} envelope, parsed by `local_model.py`'s own `_parse_response()`)
+    is deeply nested JSON -- distinct from `test_client.py`'s coverage of
+    the OUTER HTTP response body being deeply nested; this covers the
+    `json.loads(content)` call inside `_parse_response()` itself hitting
+    the same `RecursionError` failure mode."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def complete(self, *, model, messages, timeout):
+        self.calls += 1
+        return ("[" * 3000) + ("]" * 3000)
+
+
 class FakeUnreachableClient:
     def __init__(self):
         self.calls = 0
@@ -124,6 +140,21 @@ async def test_delegate_retries_once_on_malformed_content_then_succeeds():
 @pytest.mark.asyncio
 async def test_delegate_raises_malformed_after_exhausting_content_retry():
     client = FakeMalformedTwiceClient()
+    with pytest.raises(DelegateMalformedResponseError):
+        await delegate("summarize", client=client)
+    assert client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_delegate_raises_malformed_after_recursion_error_parsing_content_not_uncaught_crash():
+    """Covers the P1 fix: deeply nested JSON in the model's own {result,
+    caveats} `content` string used to raise an uncaught `RecursionError`
+    from `_parse_response()`'s `json.loads(content)` call -- crashing past
+    both the R24 same-candidate retry and the R34 chain-advance taxonomy.
+    It must now be treated as an ordinary malformed response: retried once
+    (same as a `json.JSONDecodeError`/`KeyError`), then raised as
+    `DelegateMalformedResponseError`."""
+    client = FakeDeeplyNestedContentClient()
     with pytest.raises(DelegateMalformedResponseError):
         await delegate("summarize", client=client)
     assert client.calls == 2

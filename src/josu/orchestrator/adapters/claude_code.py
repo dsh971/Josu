@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from josu.config import load_config
 from josu.config.orchestrator import McpApprovalVerified, OrchestratorAdapterConfig
 from josu.orchestrator.adapter import (
     InvocationResult,
@@ -69,8 +70,14 @@ _FORBIDDEN_GIT_TOKENS = frozenset({"push", "reset", "clean", "worktree", "config
 # Extra defense against a single Bash tool call chaining a disallowed git
 # invocation behind an allowed one (e.g. `git add * ; git push`) -- `shlex`
 # alone would still see `push` as a token, but checking for these up front
-# is a cheap, obviously-correct first gate before even tokenizing.
-_SHELL_METACHARACTERS = (";", "&&", "|", "`", "$(")
+# is a cheap, obviously-correct first gate before even tokenizing. Includes
+# output-redirection operators (`>`, `>>`, `<`) -- `git commit -m x >
+# ~/.ssh/authorized_keys` (or reading a sensitive file into a git invocation
+# via `<`) is exactly the kind of side effect a bare subcommand allowlist
+# can't catch on its own, since `>`/`<` aren't rejected by `shlex.split`.
+# `>` alone also matches every occurrence of `>>` (substring check below),
+# so both redirection forms are covered.
+_SHELL_METACHARACTERS = (";", "&&", "|", "`", "$(", ">", "<")
 
 # Claude Code's own tool-permission strings for the two MCP servers this
 # pipeline's daemon exposes -- `mcp__<server-name>__<tool-name>`, matching
@@ -340,6 +347,36 @@ def assert_config_not_staged(worktree: Path, config_path: Path) -> None:
             )
 
 
+def _forbidden_env_names(config_path: Path) -> frozenset[str]:
+    """The env var *names* (never values) referenced by any configured
+    delegate candidate's `api_key_env` -- passed to `invoke_adapter()` so
+    they're scrubbed from the spawned Claude Code subprocess's environment
+    (R31-adjacent: this daemon process may hold a resolved remote-delegate
+    credential in its own `os.environ` via `config/delegate.py`/`delegate/
+    client.py`'s lazy resolution, but the invoked CLI has no legitimate need
+    for it).
+
+    Loads `config_path` directly -- already a required parameter of `run()`
+    for the config-not-staged check -- rather than threading a separate
+    `DelegateConfig` through every caller of `run()`. `load_config()`
+    defaults to an empty config (with a warning, never raising) when
+    `config_path` doesn't exist or fails to parse, so this can never block
+    invocation; worst case, nothing extra is found to scrub. This is a
+    documented minimum, not a full safe-allowlist for the subprocess
+    environment -- see `adapter.py`'s `invoke_adapter()`/`_build_subprocess_
+    env()` docstrings for what that means in practice.
+    """
+    try:
+        loaded = load_config(config_path)
+    except Exception:
+        return frozenset()
+    return frozenset(
+        candidate.api_key_env
+        for candidate in loaded.delegate.candidates
+        if candidate.api_key_env
+    )
+
+
 def _flatten(parsed: ParsedRun) -> dict[str, Any]:
     flat = dict(parsed.result_event)
     flat["mcp_servers_connected"] = sorted(parsed.mcp_servers_connected)
@@ -362,18 +399,31 @@ def flatten_stream_json_output(
     point of having its output fields extracted at all.
 
     `after_validated`, if given, is called with the structured `ParsedRun`
-    immediately after that check passes and before flattening -- this is the
-    splice point `run()` uses for its own extra wrapper-side validations
-    (path-within-worktree, git-allowlist, config-not-staged), which need the
-    structured `ParsedRun` (recorded Bash calls, Read/Edit paths), not just
-    the flat dict this function returns. Letting `run()` hook in here means
-    it calls this one shared pipeline implementation instead of maintaining
-    a second, hand-copied parse-then-flatten pipeline of its own.
+    FIRST -- before the both-MCP-servers-connected check, not after it. This
+    is deliberate: `after_validated` is `run()`'s splice point for its own
+    wrapper-side security validations (path-within-worktree, git-allowlist,
+    config-not-staged), and those must never be skipped just because the
+    MCP-connectivity check would also fail. Parsing failed-to-connect
+    servers doesn't prevent `bash_commands`/`read_edit_paths` from being
+    populated -- a run that both leaked a path outside the worktree AND
+    failed to confirm both MCP servers connected must surface the security
+    violation, not have it silently short-circuited past by an unrelated
+    connectivity failure raising first. Running `after_validated` first
+    means its exception (if any) is what's raised; only once it passes does
+    the both-MCP-servers-connected check get a chance to raise on its own.
+    Either way, both checks independently execute every time -- neither one
+    silently prevents the other from running.
+
+    `after_validated` needs the structured `ParsedRun` (recorded Bash calls,
+    Read/Edit paths), not just the flat dict this function returns. Letting
+    `run()` hook in here means it calls this one shared pipeline
+    implementation instead of maintaining a second, hand-copied
+    parse-then-flatten pipeline of its own.
     """
     parsed = parse_stream_json(stdout)
-    assert_both_mcp_servers_connected(parsed)
     if after_validated is not None:
         after_validated(parsed)
+    assert_both_mcp_servers_connected(parsed)
     return _flatten(parsed)
 
 
@@ -429,9 +479,11 @@ def run(
     1. Re-validate the MCP manifest against the known-good daemon address
        immediately before invocation (closes the generation-to-invocation gap).
     2. Invoke via `adapter.py`'s `invoke_adapter()` (argv-list, `shell=False`,
-       command allowlist + forbidden-flag checks already applied there).
-    3. Parse `stream-json` output and confirm both required MCP servers
-       connected -- raises rather than silently proceeding if not.
+       command allowlist + `mcp_approval_verified` + forbidden-flag checks
+       already applied there; the spawned subprocess's environment is
+       scrubbed of any configured delegate candidate's `api_key_env` name --
+       see `_forbidden_env_names()` below).
+    3. Parse `stream-json` output.
     4. Verify every Read/Edit path the CLI's tool calls claim to have
        touched resolves under the worktree root, independent of whether the
        CLI's own tool call reported success.
@@ -439,7 +491,14 @@ def run(
        allowlist.
     6. Verify `config_path` (a project-root `josu.toml` override, if in use)
        was never staged for `git add`/`git commit`.
-    7. Extract the declarative result fields and combine with the
+    7. Confirm both required MCP servers connected -- raises rather than
+       silently proceeding if not. Deliberately checked AFTER steps 4-6, not
+       before: those are security assertions and must run regardless of
+       whether MCP-connectivity would also fail, so a run that fails
+       MCP-connectivity for unrelated reasons never skips verifying whether
+       something unsafe happened in the worktree. See
+       `flatten_stream_json_output()`'s docstring.
+    8. Extract the declarative result fields and combine with the
        worktree's actual `git diff` -- the diff is only ever returned after
        every check above has passed.
     """
@@ -451,15 +510,17 @@ def run(
         mcp_config=manifest.path,
         task=task,
         timeout=timeout,
+        forbidden_env_names=_forbidden_env_names(config_path),
     )
 
     # `extract_result_and_diff()` (via `flatten_stream_json_output()`) is the
-    # SAME parse -> confirm-MCP-servers -> flatten -> extract pipeline used
-    # everywhere else -- steps 4-6 of this function's docstring are spliced
-    # in via `after_validated`, right after the MCP-servers check passes and
-    # before the output is flattened, since they need the structured
-    # `ParsedRun` those functions parse internally. This is exactly one
-    # pipeline implementation, not two hand-copied ones.
+    # SAME parse -> after_validated -> confirm-MCP-servers -> flatten ->
+    # extract pipeline used everywhere else -- steps 4-6 of this function's
+    # docstring are spliced in via `after_validated`, which now runs BEFORE
+    # the both-MCP-servers-connected check (step 7), not after, so those
+    # security assertions are never silently skipped by an unrelated
+    # MCP-connectivity failure. This is exactly one pipeline implementation,
+    # not two hand-copied ones.
     parsed: ParsedRun | None = None
 
     def _apply_wrapper_side_checks(candidate: ParsedRun) -> None:

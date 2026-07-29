@@ -161,6 +161,32 @@ async def test_200_missing_choices_shape_raises_malformed(fixture_server):
 
 
 @pytest.mark.asyncio
+async def test_deeply_nested_response_body_raises_malformed_not_recursion_error(fixture_server):
+    """Covers the P1 fix: a small but deeply nested (2000+ levels) JSON
+    response body used to raise an uncaught `RecursionError` from inside
+    `json.loads` -- past both R24's same-candidate retry and R34's
+    chain-advance taxonomy. It must now surface as the same
+    `DelegateMalformedResponseError` any other unparseable body produces."""
+    base_url, set_respond = fixture_server
+    deeply_nested = ("[" * 3000) + ("]" * 3000)
+
+    def respond(handler: BaseHTTPRequestHandler):
+        body = deeply_nested.encode("utf-8")
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    set_respond(respond)
+    client = OpenAICompatibleDelegateClient(base_url, name="fixture")
+    with pytest.raises(DelegateMalformedResponseError):
+        await client.complete(
+            model="test-model", messages=[{"role": "user", "content": "hi"}], timeout=5
+        )
+
+
+@pytest.mark.asyncio
 async def test_oversized_response_treated_as_malformed_not_fully_buffered(fixture_server):
     base_url, set_respond = fixture_server
 
