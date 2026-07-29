@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from josu.config.delegate import DelegateCandidate
 
@@ -124,24 +124,47 @@ def load_chains_config(data: dict) -> tuple[ChainsConfig, list[str]]:
     """Validate the `[delegation]` section (plus the top-level `allow_remote`
     flag) of an already-parsed TOML document.
 
+    Each `[[delegation.chains]]` entry is validated independently -- unlike
+    a plain `ChainsConfig.model_validate(merged)` (which would fail the
+    WHOLE section on one malformed entry), a single malformed chain entry
+    (bad `task_type`/`candidates`/etc.) is excluded and recorded as a
+    warning, mirroring `config/orchestrator.py`'s `load_orchestrator_
+    config()` "a bad entry degrades that entry, not the whole load"
+    convention -- which this module's own docstring already claimed but
+    previously didn't implement (a malformed entry used to crash the whole
+    `[delegation]` section).
+
     Returns `(config, warnings)`, mirroring `config/delegate.py`'s
     `load_delegate_config()` -- warnings never crash config loading.
     """
     section = data.get("delegation", {})
-    merged = dict(section)
-    merged["allow_remote"] = data.get("allow_remote", False)
-    config = ChainsConfig.model_validate(merged)
+    raw_chains = section.get("chains", []) if isinstance(section, dict) else []
+    allow_remote = data.get("allow_remote", False)
 
     warnings: list[str] = []
+    chains: list[DelegationChain] = []
     seen_task_types: set[str] = set()
-    for chain in config.chains:
+    for entry in raw_chains:
+        entry_task_type = (
+            entry.get("task_type", "<unnamed>") if isinstance(entry, dict) else "<unnamed>"
+        )
+        try:
+            chain = DelegationChain.model_validate(entry)
+        except ValidationError as exc:
+            warnings.append(
+                f"delegation chain {entry_task_type!r} rejected at load time: {exc}"
+            )
+            continue
+
         if chain.task_type in seen_task_types:
             warnings.append(
                 f"delegation chain for task_type {chain.task_type!r} is defined "
                 "more than once; only the first matching entry is used"
             )
         seen_task_types.add(chain.task_type)
+        chains.append(chain)
 
+    config = ChainsConfig(chains=chains, allow_remote=allow_remote)
     return config, warnings
 
 

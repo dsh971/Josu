@@ -41,6 +41,53 @@ def _default_graph_out_dir() -> Path:
 # cross-referencing has to happen here.
 
 
+def _scan_and_collect_abandoned_worktrees(
+    repo_root: Path,
+    worktrees_dir: Path,
+    *,
+    abandoned_dir: Path | None = None,
+) -> tuple[list[str], list]:
+    """Shared implementation behind `scan_for_crash_orphaned_worktrees()`
+    and `abandoned_worktree_report()`: read `abandoned_dir`'s marker files
+    ONCE, cross-reference against `git worktree list --porcelain` to find
+    new crash orphans, mark any found, and return both the newly-marked
+    names and the full current record list -- so a caller that needs both
+    (`abandoned_worktree_report`) never has to re-glob/re-parse the same
+    marker directory a second time to get what it already read here.
+
+    When nothing new was marked, the records read at the top are still the
+    complete, up-to-date set (nothing on disk changed), so they're reused
+    as-is. Only when new orphans WERE marked (disk state changed) is a
+    second read performed, to pick up exactly those new markers.
+    """
+    from josu.fallback.quota import (
+        ABANDON_REASON_CRASH_ORPHANED,
+        default_abandoned_worktrees_dir,
+        list_abandoned_worktrees,
+        mark_worktree_abandoned,
+    )
+    from josu.orchestrator.worktree import find_orphaned_worktrees
+
+    resolved_abandoned_dir = abandoned_dir or default_abandoned_worktrees_dir(repo_root)
+    existing_records = list_abandoned_worktrees(resolved_abandoned_dir)
+    known_names = {Path(record.worktree_path).name for record in existing_records}
+
+    orphans = find_orphaned_worktrees(
+        repo_root, worktrees_dir, known_abandoned_names=known_names
+    )
+    for worktree in orphans:
+        mark_worktree_abandoned(
+            worktree,
+            reason=ABANDON_REASON_CRASH_ORPHANED,
+            abandoned_dir=resolved_abandoned_dir,
+        )
+
+    newly_orphaned_names = [worktree.path.name for worktree in orphans]
+    if not orphans:
+        return newly_orphaned_names, existing_records
+    return newly_orphaned_names, list_abandoned_worktrees(resolved_abandoned_dir)
+
+
 def scan_for_crash_orphaned_worktrees(
     repo_root: Path,
     worktrees_dir: Path,
@@ -66,30 +113,10 @@ def scan_for_crash_orphaned_worktrees(
     Returns the worktree directory names newly marked abandoned by this
     call (empty if nothing new was found).
     """
-    from josu.fallback.quota import (
-        ABANDON_REASON_CRASH_ORPHANED,
-        default_abandoned_worktrees_dir,
-        list_abandoned_worktrees,
-        mark_worktree_abandoned,
+    names, _records = _scan_and_collect_abandoned_worktrees(
+        repo_root, worktrees_dir, abandoned_dir=abandoned_dir
     )
-    from josu.orchestrator.worktree import find_orphaned_worktrees
-
-    resolved_abandoned_dir = abandoned_dir or default_abandoned_worktrees_dir(repo_root)
-    known_names = {
-        Path(record.worktree_path).name
-        for record in list_abandoned_worktrees(resolved_abandoned_dir)
-    }
-
-    orphans = find_orphaned_worktrees(
-        repo_root, worktrees_dir, known_abandoned_names=known_names
-    )
-    for worktree in orphans:
-        mark_worktree_abandoned(
-            worktree,
-            reason=ABANDON_REASON_CRASH_ORPHANED,
-            abandoned_dir=resolved_abandoned_dir,
-        )
-    return [worktree.path.name for worktree in orphans]
+    return names
 
 
 def abandoned_worktree_report(
@@ -101,17 +128,20 @@ def abandoned_worktree_report(
     """Run U8's crash-recovery scan, then return every currently-known
     abandoned worktree record -- both U7's quota-exhaustion abandonments
     and U8's crash orphans, indistinguishable in shape (only `.reason`
-    differs), exactly what `josu cleanup` lists."""
-    from josu.fallback.quota import default_abandoned_worktrees_dir, list_abandoned_worktrees
+    differs), exactly what `josu cleanup` lists.
+
+    Reuses `_scan_and_collect_abandoned_worktrees()`'s already-loaded
+    records instead of re-globbing/re-parsing `abandoned_dir` a second time
+    after the scan already read it once.
+    """
     from josu.orchestrator.worktree import default_worktrees_dir
 
     resolved_worktrees_dir = worktrees_dir or default_worktrees_dir(repo_root)
-    resolved_abandoned_dir = abandoned_dir or default_abandoned_worktrees_dir(repo_root)
 
-    scan_for_crash_orphaned_worktrees(
-        repo_root, resolved_worktrees_dir, abandoned_dir=resolved_abandoned_dir
+    _names, records = _scan_and_collect_abandoned_worktrees(
+        repo_root, resolved_worktrees_dir, abandoned_dir=abandoned_dir
     )
-    return list_abandoned_worktrees(resolved_abandoned_dir)
+    return records
 
 
 def _format_age(age: timedelta) -> str:
@@ -246,22 +276,28 @@ def _cmd_log(args: argparse.Namespace) -> int:
     from josu.observability.runlog import (
         RunNotFoundError,
         default_runlog_dir,
-        latest_run_id,
+        latest_run,
         load_run,
         render_run,
     )
 
     runlog_dir = Path(args.runlog_dir) if args.runlog_dir else default_runlog_dir(Path.cwd())
-    run_id = args.run_id or latest_run_id(runlog_dir)
-    if run_id is None:
-        print(f"No run log entries found under {runlog_dir}")
-        return 1
 
-    try:
-        record = load_run(run_id, runlog_dir)
-    except RunNotFoundError as exc:
-        print(str(exc))
-        return 1
+    if args.run_id:
+        try:
+            record = load_run(args.run_id, runlog_dir)
+        except RunNotFoundError as exc:
+            print(str(exc))
+            return 1
+    else:
+        # `latest_run()` returns the id AND the already-parsed record
+        # together, so the no-run-id path doesn't call `load_run()` again
+        # and parse the same file a second time.
+        found = latest_run(runlog_dir)
+        if found is None:
+            print(f"No run log entries found under {runlog_dir}")
+            return 1
+        _, record = found
 
     print(render_run(record))
     return 0

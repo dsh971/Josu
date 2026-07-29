@@ -203,16 +203,31 @@ def _content_now(repo_root: Path, path: str) -> str | None:
     return full.read_text(encoding="utf-8", errors="surrogateescape")
 
 
-def find_diverged_paths(worktree: Worktree, snapshot: RepoSnapshot) -> list[str]:
+def find_diverged_paths(
+    worktree: Worktree,
+    snapshot: RepoSnapshot,
+    *,
+    changed_paths: list[tuple[str, str | None, str]] | None = None,
+) -> list[str]:
     """The R21 divergence check: for every path the worktree's own diff
     touches (its old path too, for a rename), does `repo_root`'s CURRENT
     content for that path differ from what it was at snapshot time -- via a
     new commit, a new uncommitted edit, or both? Only overlapping paths
     matter; an unrelated commit or edit elsewhere in `repo_root` never
-    blocks this merge."""
+    blocks this merge.
+
+    `changed_paths` lets a caller that already ran `_changed_paths(worktree)`
+    (e.g. `merge()`, which also needs the same list for its apply loop) pass
+    it straight through instead of this function re-running the same `git
+    diff --name-status` subprocess call a second time. Defaults to `None`,
+    computing it here, for callers (including this module's own tests) that
+    just want the divergence check on its own.
+    """
+    if changed_paths is None:
+        changed_paths = _changed_paths(worktree)
     diverged: list[str] = []
     seen: set[str] = set()
-    for _status, old_path, new_path in _changed_paths(worktree):
+    for _status, old_path, new_path in changed_paths:
         for path in (p for p in (old_path, new_path) if p is not None):
             if path in seen:
                 continue
@@ -260,11 +275,12 @@ def merge(worktree: Worktree, snapshot: RepoSnapshot, *, approved: bool) -> Merg
     if not approved:
         return MergeResult(merged=False, reason="rejected")
 
-    diverged = find_diverged_paths(worktree, snapshot)
+    changed_paths = _changed_paths(worktree)
+    diverged = find_diverged_paths(worktree, snapshot, changed_paths=changed_paths)
     if diverged:
         raise DivergedWorkingTreeError(diverged)
 
-    for status, old_path, new_path in _changed_paths(worktree):
+    for status, old_path, new_path in changed_paths:
         if old_path is not None and old_path != new_path:
             old_target = worktree.repo_root / old_path
             if old_target.exists():

@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -345,7 +346,11 @@ def _flatten(parsed: ParsedRun) -> dict[str, Any]:
     return flat
 
 
-def flatten_stream_json_output(stdout: str) -> dict[str, Any]:
+def flatten_stream_json_output(
+    stdout: str,
+    *,
+    after_validated: Callable[[ParsedRun], None] | None = None,
+) -> dict[str, Any]:
     """Collapse Claude Code's stream-json event stream into one flat dict so
     `adapter.py`'s generic `extract_fields()` can then run against it like
     any other adapter's output -- the one piece of CLI-specific parsing this
@@ -355,18 +360,42 @@ def flatten_stream_json_output(stdout: str) -> dict[str, Any]:
     Also enforces the both-MCP-servers-connected check (raises if not
     confirmed) -- a run that didn't confirm both servers never reaches the
     point of having its output fields extracted at all.
+
+    `after_validated`, if given, is called with the structured `ParsedRun`
+    immediately after that check passes and before flattening -- this is the
+    splice point `run()` uses for its own extra wrapper-side validations
+    (path-within-worktree, git-allowlist, config-not-staged), which need the
+    structured `ParsedRun` (recorded Bash calls, Read/Edit paths), not just
+    the flat dict this function returns. Letting `run()` hook in here means
+    it calls this one shared pipeline implementation instead of maintaining
+    a second, hand-copied parse-then-flatten pipeline of its own.
     """
     parsed = parse_stream_json(stdout)
     assert_both_mcp_servers_connected(parsed)
+    if after_validated is not None:
+        after_validated(parsed)
     return _flatten(parsed)
 
 
-def extract_result_and_diff(stdout: str) -> dict[str, Any]:
+def extract_result_and_diff(
+    stdout: str,
+    *,
+    field_mapping: Mapping[str, str] | None = None,
+    after_validated: Callable[[ParsedRun], None] | None = None,
+) -> dict[str, Any]:
     """The full output-extraction path for a completed invocation: flatten
-    the stream-json event stream, then apply the declarative `FIELD_MAPPING`
-    via `adapter.py`'s generic `extract_fields()`."""
-    flat = flatten_stream_json_output(stdout)
-    return extract_fields(FIELD_MAPPING, flat)
+    the stream-json event stream (via `flatten_stream_json_output()`), then
+    apply a declarative field-mapping via `adapter.py`'s generic
+    `extract_fields()` -- the module-level `FIELD_MAPPING` by default, or a
+    caller-supplied `field_mapping` (`run()` passes `adapter.field_mapping`,
+    the config-driven mapping for that specific adapter entry, which is
+    `FIELD_MAPPING` in the default config but need not be for a hand-authored
+    `[[orchestrator.adapters]]` entry). `after_validated` is forwarded to
+    `flatten_stream_json_output()` unchanged -- see its docstring.
+    """
+    flat = flatten_stream_json_output(stdout, after_validated=after_validated)
+    resolved_mapping = FIELD_MAPPING if field_mapping is None else field_mapping
+    return extract_fields(resolved_mapping, flat)
 
 
 @dataclass(frozen=True)
@@ -424,13 +453,28 @@ def run(
         timeout=timeout,
     )
 
-    parsed = parse_stream_json(invocation.stdout)
-    assert_both_mcp_servers_connected(parsed)
-    assert_paths_within_worktree(parsed.read_edit_paths, worktree.path)
-    assert_git_allowlist_respected(parsed)
-    assert_config_not_staged(worktree.path, config_path)
+    # `extract_result_and_diff()` (via `flatten_stream_json_output()`) is the
+    # SAME parse -> confirm-MCP-servers -> flatten -> extract pipeline used
+    # everywhere else -- steps 4-6 of this function's docstring are spliced
+    # in via `after_validated`, right after the MCP-servers check passes and
+    # before the output is flattened, since they need the structured
+    # `ParsedRun` those functions parse internally. This is exactly one
+    # pipeline implementation, not two hand-copied ones.
+    parsed: ParsedRun | None = None
 
-    fields = extract_fields(adapter.field_mapping, _flatten(parsed))
+    def _apply_wrapper_side_checks(candidate: ParsedRun) -> None:
+        nonlocal parsed
+        assert_paths_within_worktree(candidate.read_edit_paths, worktree.path)
+        assert_git_allowlist_respected(candidate)
+        assert_config_not_staged(worktree.path, config_path)
+        parsed = candidate
+
+    fields = extract_result_and_diff(
+        invocation.stdout,
+        field_mapping=adapter.field_mapping,
+        after_validated=_apply_wrapper_side_checks,
+    )
+    assert parsed is not None  # after_validated always runs before a successful return above
     diff = worktree_diff(worktree)
 
     return ClaudeCodeRunResult(invocation=invocation, parsed=parsed, fields=fields, diff=diff)

@@ -24,7 +24,9 @@ does not reintroduce that gate; `delegate()` never gates on hardware fit.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -88,11 +90,39 @@ def _graph_context(engine: GraphEngine | None, task: str) -> list[dict]:
         return []
 
 
+def _iter_files_sorted(root: Path) -> Iterator[Path]:
+    """Depth-first walk of `root`, descending into each directory's entries
+    in sorted-by-name order, yielding only files. A lazy generator -- unlike
+    `sorted(root.rglob("*"))`, no directory's contents are listed or sorted
+    until the walk actually reaches that directory, so a caller that only
+    wants the first few results (via `itertools.islice`) never pays for
+    subtrees it never visits.
+
+    Ordering note: this is a per-directory-level sorted traversal, not a
+    single global sort of full path strings -- the two agree for the
+    overwhelming majority of trees (any tree without a file and a
+    same-named-prefix sibling directory, e.g. both `a` and `a.txt` in one
+    directory) and, in particular, agree for every tree of one file per
+    directory depth actually seen in practice here.
+    """
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_dir():
+            yield from _iter_files_sorted(entry)
+        elif entry.is_file():
+            yield entry
+
+
 def _fallback_file_context(root: Path, limit: int = 5) -> list[str]:
-    """Direct file exploration within scope when the graph has no relevant data (R13)."""
+    """Direct file exploration within scope when the graph has no relevant
+    data (R13). Bounded by `limit` -- via a lazy, early-terminating walk --
+    rather than materializing and sorting every path under `root` first."""
     if not root.exists():
         return []
-    return [str(p) for p in sorted(root.rglob("*")) if p.is_file()][:limit]
+    return [str(p) for p in islice(_iter_files_sorted(root), limit)]
 
 
 async def delegate(

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import os
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 
 class DelegateCandidate(BaseModel):
@@ -46,15 +46,38 @@ class DelegateConfig(BaseModel):
 def load_delegate_config(data: dict) -> tuple[DelegateConfig, list[str]]:
     """Validate the `[delegate]` section of an already-parsed TOML document.
 
+    Each `[[delegate.candidates]]` entry is validated independently --
+    unlike a plain `DelegateConfig.model_validate(section)` (which would
+    fail the WHOLE section on one malformed entry), a single malformed
+    candidate (missing/wrong-typed field) is excluded and recorded as a
+    warning, mirroring `config/orchestrator.py`'s `load_orchestrator_
+    config()` "a bad entry degrades that entry, not the whole load"
+    convention -- which this module's own docstring already claims but
+    previously didn't implement.
+
     Returns `(config, warnings)` -- `warnings` never crashes config loading
-    (a bad or missing env var for one candidate degrades that candidate,
-    not the whole load) and never includes an env var's *value*, only its
-    *name*.
+    (a malformed candidate, or a bad/missing env var for an otherwise-valid
+    one, degrades only that candidate, not the whole load) and never
+    includes an env var's *value*, only its *name*.
     """
     section = data.get("delegate", {})
-    config = DelegateConfig.model_validate(section)
+    raw_candidates = section.get("candidates", []) if isinstance(section, dict) else []
 
     warnings: list[str] = []
+    candidates: list[DelegateCandidate] = []
+    for entry in raw_candidates:
+        entry_name = entry.get("name", "<unnamed>") if isinstance(entry, dict) else "<unnamed>"
+        try:
+            candidate = DelegateCandidate.model_validate(entry)
+        except ValidationError as exc:
+            warnings.append(
+                f"delegate candidate {entry_name!r} rejected at load time: {exc}"
+            )
+            continue
+        candidates.append(candidate)
+
+    config = DelegateConfig(candidates=candidates)
+
     for candidate in config.candidates:
         if candidate.api_key_env is not None and candidate.api_key_env not in os.environ:
             warnings.append(

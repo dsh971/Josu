@@ -54,10 +54,8 @@ from typing import Any
 from josu.config.chains import ChainsConfig, resolve_chain
 from josu.config.delegate import DelegateCandidate
 from josu.delegate.client import (
-    DelegateAPIError,
     DelegateClient,
-    DelegateMalformedResponseError,
-    DelegateRateLimitedError,
+    DelegateError,
     DelegateUnreachableError,
     OpenAICompatibleDelegateClient,
 )
@@ -67,16 +65,19 @@ from josu.graph.engine import GraphEngine
 from josu.models.curated import preflight_check
 
 # The exception types that mean "this candidate failed, try the next one"
-# (R34). `DelegateMalformedResponseError` IS included here: R24's
+# (R34). `DelegateError` -- the common base class in `client.py` -- covers
+# `DelegateUnreachableError`, `DelegateRateLimitedError`, `DelegateAPIError`,
+# and `DelegateMalformedResponseError` uniformly, so any subclass added to
+# `client.py`'s taxonomy in the future advances the chain automatically
+# without this tuple needing a matching edit (see c189ce7: a hand-enumerated
+# list here once drifted out of sync with that taxonomy).
+# `DelegateMalformedResponseError` IS included via `DelegateError`: R24's
 # same-candidate retry is handled entirely inside `delegate()` before this
 # module ever sees it, but once that retry is exhausted and the exception
-# reaches this module, it advances the chain exactly like the other three --
-# see the module docstring and the plan's flowchart.
+# reaches this module, it advances the chain exactly like the others -- see
+# the module docstring and the plan's flowchart.
 _ADVANCE_ON: tuple[type[BaseException], ...] = (
-    DelegateUnreachableError,
-    DelegateRateLimitedError,
-    DelegateAPIError,
-    DelegateMalformedResponseError,
+    DelegateError,
     TimeoutError,
 )
 
@@ -205,29 +206,22 @@ async def execute_chain(
                     client=client,
                     timeout=timeout,
                 )
-            except DelegateRateLimitedError as exc:
-                # R34's Retry-After capture: recorded here, before this
-                # attempt's exception propagates up into run_chain()'s
-                # advance-to-next-candidate handling.
+            except DelegateError as exc:
+                # Every `DelegateError` subclass means "this candidate
+                # failed, try the next one" (R34) -- including
+                # `DelegateMalformedResponseError`, since `delegate()`
+                # already ran R24's one-retry-same-candidate before raising
+                # it here; no second retry is added in this module. Only
+                # `DelegateRateLimitedError` carries a `retry_after` value;
+                # `getattr` handles that uniformly without a separate except
+                # block per subclass.
                 skip_records.append(
                     SkipRecord(
                         candidate=candidate.name,
                         error=type(exc).__name__,
-                        retry_after=exc.retry_after,
+                        retry_after=getattr(exc, "retry_after", None),
                     )
                 )
-                raise
-            except (DelegateUnreachableError, DelegateAPIError) as exc:
-                skip_records.append(SkipRecord(candidate=candidate.name, error=type(exc).__name__))
-                raise
-            except DelegateMalformedResponseError as exc:
-                # `delegate()` already ran R24's one-retry-same-candidate
-                # before raising this -- no second retry is added here. Once
-                # it reaches this point the candidate is treated as failed
-                # for chain-advance purposes, same as the R34 conditions
-                # above: recorded and re-raised so `run_chain()`'s
-                # `advance_on` handling moves on to the next candidate.
-                skip_records.append(SkipRecord(candidate=candidate.name, error=type(exc).__name__))
                 raise
 
         return _attempt

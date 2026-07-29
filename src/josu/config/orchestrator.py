@@ -53,8 +53,11 @@ ALLOWED_ADAPTER_COMMANDS = frozenset({"claude"})
 # (or, for `stream-json`, near-declaratively -- see adapters/claude_code.py)
 # extract fields from. An adapter attested for MCP approval but with no
 # declarable mode here is rejected at load time (R38) rather than accepted
-# and left to fail unpredictably at invocation.
-ALLOWED_OUTPUT_MODES = frozenset({"stream-json", "json"})
+# and left to fail unpredictably at invocation. Narrowed to just
+# `stream-json` -- the only mode any adapter actually parses today (see
+# adapters/claude_code.py); add `"json"` back once a real adapter implements
+# plain-JSON output parsing.
+ALLOWED_OUTPUT_MODES = frozenset({"stream-json"})
 
 # R37: an attestation older than this warns (not blocks) -- "silently stale
 # forever" is the gap this closes, per the plan's Risks & Dependencies.

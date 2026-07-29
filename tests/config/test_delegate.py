@@ -128,3 +128,32 @@ def test_unset_api_key_env_warning_never_includes_the_secret_value(monkeypatch):
 def test_candidate_missing_required_field_raises():
     with pytest.raises(Exception):
         DelegateCandidate.model_validate({"name": "incomplete", "endpoint": "http://x"})
+
+
+def test_one_bad_candidate_entry_does_not_crash_the_whole_load():
+    """Mirrors config/orchestrator.py's convention: a single malformed
+    `[[delegate.candidates]]` entry is excluded and warned about, not a
+    whole-`[delegate]`-section crash -- matching this module's own
+    docstring claim that a bad candidate degrades only that candidate."""
+    data = {
+        "delegate": {
+            "candidates": [
+                {
+                    "name": "good-candidate",
+                    "endpoint": "http://localhost:11434/v1",
+                    "local": True,
+                    "model": "qwen2.5-coder:7b",
+                },
+                {
+                    # Missing required fields (`local`, `model`) -- malformed.
+                    "name": "bad-candidate",
+                    "endpoint": "http://x",
+                },
+            ]
+        }
+    }
+    config, warnings = load_delegate_config(data)
+
+    assert [c.name for c in config.candidates] == ["good-candidate"]
+    assert len(warnings) == 1
+    assert "bad-candidate" in warnings[0]

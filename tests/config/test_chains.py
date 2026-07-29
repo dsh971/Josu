@@ -281,6 +281,29 @@ def test_v1_task_type_categories_match_origin_doc_guide():
     }
 
 
+def test_one_bad_chain_entry_does_not_crash_the_whole_load(tmp_path):
+    """Mirrors config/orchestrator.py's convention: a single malformed
+    `[[delegation.chains]]` entry is excluded and warned about, not a
+    whole-`[delegation]`-section crash -- matching this module's own
+    docstring claim that a bad entry degrades only that entry."""
+    toml_text = (
+        _TWO_CANDIDATES_TOML
+        + """
+[[delegation.chains]]
+task_type = "file_summarization"
+candidates = ["local-ollama"]
+
+[[delegation.chains]]
+candidates = ["remote-kimi"]
+"""
+    )
+    data = _parse(toml_text, tmp_path)
+    config, warnings = load_chains_config(data)
+
+    assert [c.task_type for c in config.chains] == ["file_summarization"]
+    assert len(warnings) == 1
+
+
 def test_claude_md_template_contains_current_delegation_guide_content():
     """Covers the 'generated CLAUDE.md in a worktree contains the current
     delegation guide content' scenario -- U3 only produces the template

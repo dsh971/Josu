@@ -291,25 +291,50 @@ def load_run(run_id: str, runlog_dir: Path) -> RunRecord:
     return RunRecord.from_dict(json.loads(raw))
 
 
+def _run_paths(runlog_dir: Path) -> list[Path]:
+    if not runlog_dir.exists():
+        return []
+    return list(runlog_dir.glob("*.json"))
+
+
 def list_runs(runlog_dir: Path) -> list[str]:
     """All run ids with a record under `runlog_dir`, in no particular
     order. Returns an empty list if the directory doesn't exist yet (no
     runs have been logged)."""
-    if not runlog_dir.exists():
-        return []
-    return [p.stem for p in runlog_dir.glob("*.json")]
+    return [p.stem for p in _run_paths(runlog_dir)]
+
+
+def _latest_run_path(runlog_dir: Path) -> Path | None:
+    """The most recently *modified* run-log file under `runlog_dir`, by
+    filesystem mtime -- `run_id` (a `uuid4().hex`) carries no timestamp
+    ordering of its own, and records are always saved (and re-saved, per
+    `save_run()`'s docstring) at the moment they're most recently updated,
+    so mtime tracks "most recently started/updated run" without needing to
+    parse every record's body just to compare a `started_at` field."""
+    paths = _run_paths(runlog_dir)
+    if not paths:
+        return None
+    return max(paths, key=lambda p: p.stat().st_mtime)
 
 
 def latest_run_id(runlog_dir: Path) -> str | None:
-    """The most recently started run under `runlog_dir` (by `started_at`),
-    or `None` if there are none -- used by `josu log` when no run id is
-    given."""
-    run_ids = list_runs(runlog_dir)
-    if not run_ids:
+    """The most recently updated run under `runlog_dir`, or `None` if there
+    are none -- used by `josu log` when no run id is given."""
+    path = _latest_run_path(runlog_dir)
+    return path.stem if path is not None else None
+
+
+def latest_run(runlog_dir: Path) -> tuple[str, RunRecord] | None:
+    """Same "most recently updated run" lookup as `latest_run_id()`, but
+    also returns the already-parsed `RunRecord` -- so a caller that needs
+    both the id and the record (e.g. `cli.py`'s `_cmd_log`) doesn't have to
+    call `load_run()` again afterward and parse the same file twice.
+    Returns `None` if there are no runs, matching `latest_run_id()`.
+    """
+    path = _latest_run_path(runlog_dir)
+    if path is None:
         return None
-    records = [load_run(run_id, runlog_dir) for run_id in run_ids]
-    records.sort(key=lambda r: r.started_at)
-    return records[-1].run_id
+    return path.stem, RunRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
 
 def render_run(record: RunRecord) -> str:
