@@ -2,8 +2,10 @@
 
 Subcommands are added incrementally as their owning implementation unit
 lands (see docs/plans/2026-07-21-001-feat-hybrid-local-hosted-coding-agent-plan.md).
-`daemon` ships with U1 since daemon.py has to be reachable somehow; `init`,
-`run`, and `models` land with their respective (not-yet-built) units.
+`daemon` ships with U1 since daemon.py has to be reachable somehow; `init`
+lands with U9 (`proactive/watchers.py`'s `install_commit_hook()` -- chains
+to an existing `post-commit` hook rather than overwriting it); `run` and
+`models` land with their respective (not-yet-built) units.
 `delegate` lands with U7 -- a developer-initiated escape hatch for routing
 a bounded task directly to the local delegate worker (`fallback/quota.py`,
 `delegate/chain.py`'s `execute_chain()`) when Claude Code is quota/rate-
@@ -213,6 +215,33 @@ def _cmd_daemon_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_init(args: argparse.Namespace) -> int:
+    """U9's `josu init`: install the `post-commit` hook that drives
+    commit-triggered proactive checks (R15), via `proactive/watchers.py`'s
+    `install_commit_hook()`. Detects an existing hook (Husky, `pre-commit`,
+    or a hand-written script) and chains to it rather than overwriting it;
+    aborts with a clear warning instead of clobbering existing tooling if
+    that can't be done safely.
+    """
+    from josu.proactive.watchers import HookInstallationError, install_commit_hook
+
+    repo_root = Path(args.repo_root) if args.repo_root else Path.cwd()
+
+    try:
+        result = install_commit_hook(repo_root)
+    except HookInstallationError as exc:
+        print(f"josu init: {exc}")
+        return 1
+
+    if result.already_installed:
+        print(f"josu init: post-commit hook already installed at {result.hook_path}")
+    elif result.chained_existing:
+        print(f"josu init: chained to existing post-commit hook at {result.hook_path}")
+    else:
+        print(f"josu init: installed post-commit hook at {result.hook_path}")
+    return 0
+
+
 def _cmd_log(args: argparse.Namespace) -> int:
     from josu.observability.runlog import (
         RunNotFoundError,
@@ -365,6 +394,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     start_parser.set_defaults(func=_cmd_daemon_start)
+
+    init_parser = subparsers.add_parser(
+        "init",
+        help=(
+            "Install the post-commit hook that drives commit-triggered "
+            "proactive checks (U9, R15) -- chains to an existing hook "
+            "rather than overwriting it"
+        ),
+    )
+    init_parser.add_argument(
+        "--repo-root",
+        default=None,
+        help="Repo root to install the hook into (default: cwd)",
+    )
+    init_parser.set_defaults(func=_cmd_init)
 
     log_parser = subparsers.add_parser("log", help="Render a run's run-log record")
     log_parser.add_argument(
