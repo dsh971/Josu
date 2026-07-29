@@ -97,6 +97,17 @@ HOSTED_PAUSED_NOTICE = (
 # later unit might record via the same marker shape).
 ABANDON_REASON_QUOTA_EXHAUSTION = "quota_exhaustion_detected_mid_run"
 
+# U8's crash-recovery reason: a worktree `git worktree list --porcelain`
+# still reports on daemon/CLI startup with no matching completed/rejected/
+# abandoned record -- the wrapper process died before it could finish
+# normally or record why it didn't. Recorded via this SAME marker
+# mechanism (not a second, incompatible one) so `josu cleanup` (U8) sees
+# one unified abandoned-worktrees list regardless of which reason applies.
+# Written by `cli.py`'s `scan_for_crash_orphaned_worktrees()`, not by
+# anything in this module directly -- kept here purely as the shared
+# string constant, mirroring `ABANDON_REASON_QUOTA_EXHAUSTION` above.
+ABANDON_REASON_CRASH_ORPHANED = "crash_orphaned_no_matching_record"
+
 
 # --- Failure signal + pluggable classifier ---------------------------------
 
@@ -218,14 +229,20 @@ class AbandonedWorktreeRecord:
     """One worktree classified as abandoned -- the JSON shape persisted to
     (and read back from) a marker file under `ABANDONED_WORKTREES_SUBDIR`.
     Deliberately plain strings/primitives only, mirroring
-    `observability/runlog.py`'s records -- easy for a future `josu cleanup`
-    (U8) to load with nothing more than `json.loads()`."""
+    `observability/runlog.py`'s records -- easy for `josu cleanup` (U8) to
+    load with nothing more than `json.loads()`.
+
+    `task_description` (U8) is optional and `None` by default so a marker
+    file written before this field existed still loads cleanly via
+    `AbandonedWorktreeRecord(**data)` -- a missing key just falls back to
+    the default rather than raising."""
 
     worktree_path: str
     branch: str
     repo_root: str
     reason: str
     detected_at: str
+    task_description: str | None = None
 
 
 def default_abandoned_worktrees_dir(repo_root: Path) -> Path:
@@ -247,6 +264,12 @@ def mark_worktree_abandoned(
     the worktree's own contents/git state -- the marker lives entirely
     alongside it, in `abandoned_dir` (defaults to
     `default_abandoned_worktrees_dir(worktree.repo_root)`).
+
+    Reused as-is by U8's crash-recovery path (`cli.py`'s
+    `scan_for_crash_orphaned_worktrees()`, passing `reason=
+    ABANDON_REASON_CRASH_ORPHANED`) -- one abandonment mechanism serving
+    both this module's quota-exhaustion callers and U8's crash-orphan
+    callers, not two incompatible ones.
     """
     resolved_dir = abandoned_dir or default_abandoned_worktrees_dir(worktree.repo_root)
     resolved_dir.mkdir(parents=True, exist_ok=True)
@@ -257,6 +280,7 @@ def mark_worktree_abandoned(
         repo_root=str(worktree.repo_root),
         reason=reason,
         detected_at=datetime.now(timezone.utc).isoformat(),
+        task_description=worktree.task_description,
     )
     marker_path = resolved_dir / f"{worktree.path.name}.json"
     marker_path.write_text(json.dumps(asdict(record), indent=2))
