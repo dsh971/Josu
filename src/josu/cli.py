@@ -314,12 +314,14 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
     unshared queue living in this CLI process, independent of the daemon's
     own, defeating the "one shared queue serializes every delegate call"
     invariant. Instead this is now an `httpx` client of the daemon's
-    `/delegate/internal` endpoint (`delegate/internal_api.py`), mirroring
-    `delegate/client.py`'s async-client pattern applied to an internal call.
-    If the daemon isn't reachable, this fails with a clear, actionable
-    message -- never a stack trace, and never a silent fallback to a local
-    queue (that fallback would silently reintroduce the exact bug this unit
-    fixes).
+    `/delegate/internal` endpoint (`delegate/internal_api.py`), via the
+    shared `delegate/daemon_client.py` helper (simplify pass after U13/U14:
+    this used to hand-roll its own `httpx.AsyncClient` +
+    `except httpx.TransportError` block, duplicated near-identically in
+    `orchestrator/run.py` and `proactive/watchers.py`). If the daemon isn't
+    reachable, this fails with a clear, actionable message -- never a stack
+    trace, and never a silent fallback to a local queue (that fallback
+    would silently reintroduce the exact bug this unit fixes).
 
     R28/R29's bounded-task-type gate (`fallback/quota.py`'s
     `TaskNotBoundedError`) is still enforced here, client-side, before any
@@ -328,11 +330,13 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
     """
     import asyncio
 
-    import httpx
-
     from josu.config.chains import DELEGABLE_TASK_TYPES
     from josu.daemon import DEFAULT_HOST, DEFAULT_PORT
-    from josu.delegate.internal_api import DELEGATE_INTERNAL_PATH
+    from josu.delegate.daemon_client import (
+        DaemonNotReachableError,
+        DelegateInternalError,
+        post_delegate_internal,
+    )
     from josu.fallback.quota import HOSTED_PAUSED_NOTICE, TaskNotBoundedError
 
     if args.task_type not in DELEGABLE_TASK_TYPES:
@@ -343,25 +347,17 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
     port = args.port or DEFAULT_PORT
     base_url = f"http://{host}:{port}"
 
-    async def _call() -> httpx.Response:
-        async with httpx.AsyncClient(base_url=base_url, timeout=120.0) as client:
-            return await client.post(
-                DELEGATE_INTERNAL_PATH,
-                json={"task_type": args.task_type, "task": args.task},
-            )
-
     try:
-        response = asyncio.run(_call())
-    except httpx.TransportError:
-        print(
-            f"josu delegate: could not reach the josu daemon at {base_url} -- "
-            "start it with `josu daemon start`"
+        payload = asyncio.run(
+            post_delegate_internal(
+                base_url, {"task_type": args.task_type, "task": args.task}
+            )
         )
+    except DaemonNotReachableError as exc:
+        print(f"josu delegate: {exc}")
         return 1
-
-    payload = response.json()
-    if response.status_code >= 400:
-        print(f"josu delegate: {payload.get('error', 'error')}: {payload.get('detail')}")
+    except DelegateInternalError as exc:
+        print(f"josu delegate: {exc.error}: {exc.detail}")
         return 1
 
     print(HOSTED_PAUSED_NOTICE)
@@ -392,11 +388,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
     approval, then reports the outcome.
 
     Requires the daemon already running (the adapter's MCP manifest points
-    at it, same as U14's `_cmd_delegate` above) -- `run_task()` checks this
-    FIRST, before any worktree/git work, so a `DaemonNotReachableError`
-    surfaces here as a clear, actionable message rather than a stack trace.
+    at it, same as U14's `_cmd_delegate` above). `run_task()` itself also
+    checks this first, before any worktree/git work -- but simplify pass:
+    this subcommand now ALSO checks reachability here, at the very start,
+    before `load_config()`/`GraphifyEngine(...)` (config load and graph
+    directory creation, both disk I/O with side effects) -- matching the
+    "fail fast, no side effects" intent `run_task()`'s own docstring already
+    documents, but which previously only started applying after this
+    subcommand's own config-load/directory-creation side effects had
+    already happened. Uses the same shared `delegate/daemon_client.py`
+    helper `orchestrator/run.py` uses internally.
     """
     from josu.config import load_config
+    from josu.delegate.daemon_client import DaemonNotReachableError, check_daemon_reachable
     from josu.graph.build import GraphifyEngine
     from josu.observability.runlog import (
         RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT,
@@ -404,7 +408,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
         RUN_OUTCOME_MERGED,
         RUN_OUTCOME_REJECTED,
     )
-    from josu.orchestrator.run import DaemonNotReachableError, NoUsableAdapterError, run_task
+    from josu.orchestrator.run import NoUsableAdapterError, run_task
+
+    host = args.host or DEFAULT_HOST
+    port = args.port or DEFAULT_PORT
+
+    try:
+        check_daemon_reachable(host, port)
+    except DaemonNotReachableError as exc:
+        print(f"josu run: {exc}")
+        return 1
 
     repo_root = Path(args.repo_root) if args.repo_root else Path.cwd()
     config_path = Path(args.config) if args.config else resolve_config_path()
@@ -412,9 +425,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     graph_out_dir = Path(args.graph_out_dir) if args.graph_out_dir else _default_graph_out_dir()
     engine = GraphifyEngine(out_dir=graph_out_dir)
-
-    host = args.host or DEFAULT_HOST
-    port = args.port or DEFAULT_PORT
 
     try:
         result = run_task(

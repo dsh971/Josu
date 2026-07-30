@@ -19,6 +19,7 @@ import httpx
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 from starlette.applications import Starlette
+from starlette.requests import Request
 
 from josu.config.chains import ChainsConfig, DelegationChain
 from josu.config.delegate import DelegateCandidate
@@ -60,6 +61,22 @@ class ExplodingClient:
 
     async def complete(self, *, model, messages, timeout):
         raise AssertionError("this candidate must never be contacted (R39)")
+
+
+class CapturingClient:
+    """Fake `DelegateClient` that records the exact `messages` payload
+    `local_model.py`'s `delegate()` composed and passed to `complete()` --
+    used to prove `scope_root`'s R13 file-context fallback actually fired,
+    not just that the call succeeded."""
+
+    def __init__(self, result="ok", caveats=""):
+        self._result = result
+        self._caveats = caveats
+        self.received_messages: list[list[dict]] = []
+
+    async def complete(self, *, model, messages, timeout):
+        self.received_messages.append(messages)
+        return json.dumps({"result": self._result, "caveats": self._caveats})
 
 
 def _app_and_queue(*, chains_config=None, registry=None, client_factory=None, queue=None):
@@ -105,6 +122,40 @@ async def test_task_type_shape_resolves_against_given_chains_config_and_registry
     body = response.json()
     assert body["result"] == "summarized"
     assert body["caveats"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_scope_with_path_triggers_r13_file_context_fallback_same_as_mcp_tool(tmp_path):
+    """Simplify-pass regression test: `internal_api.py`'s handler must
+    derive `scope_root` from `scope={"path": ...}` the same way
+    `delegate/server.py`'s MCP tool (`call_tool()`) already does, so
+    `local_model.py`'s R13 file-context fallback (`_fallback_file_context()`)
+    fires identically whether a caller reaches `execute_chain()` through the
+    MCP tool or through this HTTP route.
+
+    Proven the same way the graph-miss fallback is proven elsewhere: no
+    graph engine wired (so the graph lookup finds nothing), a real directory
+    with files at `scope["path"]`, and the client-received `messages`
+    payload actually containing those file paths in `context` -- not merely
+    that the call succeeded.
+    """
+    (tmp_path / "a.py").write_text("a = 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("b = 2\n", encoding="utf-8")
+
+    capturing = CapturingClient(result="scoped")
+    app, _queue = _app_and_queue(client_factory=lambda c: capturing)
+
+    async with _client(app) as client:
+        response = await client.post(
+            DELEGATE_INTERNAL_PATH,
+            json={"task_type": TASK_TYPE, "task": "do it", "scope": {"path": str(tmp_path)}},
+        )
+
+    assert response.status_code == 200
+    assert len(capturing.received_messages) == 1
+    user_content = json.loads(capturing.received_messages[0][1]["content"])
+    assert user_content["context"] != []
+    assert any(str(tmp_path / "a.py") == path for path in user_content["context"])
 
 
 @pytest.mark.asyncio
@@ -206,6 +257,46 @@ async def test_oversized_body_returns_structured_413_not_unhandled_exception():
         response = await client.post(DELEGATE_INTERNAL_PATH, json={"task_type": TASK_TYPE, "task": huge_task})
     assert response.status_code == 413
     assert response.json()["error"] == "request_too_large"
+
+
+@pytest.mark.asyncio
+async def test_oversized_body_with_content_length_header_is_rejected_without_reading_body():
+    """Simplify-pass regression test: an oversized request that DECLARES its
+    size via `Content-Length` must be rejected before the handler ever calls
+    `request.body()` -- proven by handing the handler a `Request` whose
+    `receive` callable raises if invoked at all, so any attempt to buffer
+    the body would fail the test rather than merely being slow."""
+    route = build_delegate_internal_route(
+        queue=DelegateQueue(),
+        chains_config=ChainsConfig(
+            chains=[DelegationChain(task_type=TASK_TYPE, candidates=["c1"])],
+            allow_remote=True,
+        ),
+        registry={"c1": DelegateCandidate(name="c1", endpoint="http://example.invalid", local=True, model="m")},
+    )
+
+    class ExplodingReceive:
+        """An ASGI `receive` callable that fails the test if the handler
+        ever tries to read the request body."""
+
+        async def __call__(self):
+            raise AssertionError(
+                "request.body() must not be called when Content-Length already exceeds the cap"
+            )
+
+    oversized_length = MAX_BODY_BYTES + 1000
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": DELEGATE_INTERNAL_PATH,
+        "headers": [(b"content-length", str(oversized_length).encode())],
+    }
+    request = Request(scope, receive=ExplodingReceive())
+
+    response = await route.endpoint(request)
+
+    assert response.status_code == 413
+    assert json.loads(bytes(response.body))["error"] == "request_too_large"
 
 
 @pytest.mark.asyncio

@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
@@ -140,6 +141,26 @@ def build_delegate_internal_route(
     """
 
     async def handle(request: Request) -> JSONResponse:
+        # Check the declared `Content-Length` FIRST, before ever reading the
+        # body -- an oversized request is rejected without buffering it into
+        # memory at all. The post-read length check just below remains as a
+        # fallback for a chunked request with no `Content-Length` header (a
+        # declared size isn't guaranteed to be present or honest, so both
+        # checks are needed; this one just avoids the common case where the
+        # header IS present and already tells us enough to reject early).
+        declared_length = request.headers.get("content-length")
+        if declared_length is not None:
+            try:
+                declared_bytes = int(declared_length)
+            except ValueError:
+                declared_bytes = None
+            if declared_bytes is not None and declared_bytes > MAX_BODY_BYTES:
+                return _error_response(
+                    "request_too_large",
+                    f"request body exceeds the maximum of {MAX_BODY_BYTES} bytes",
+                    status_code=413,
+                )
+
         body_bytes = await request.body()
         if len(body_bytes) > MAX_BODY_BYTES:
             return _error_response(
@@ -191,6 +212,18 @@ def build_delegate_internal_route(
             resolved_registry = registry
             resolved_chains_config = chains_config
 
+        # Parity with `delegate/server.py`'s MCP tool (`call_tool()`): derive
+        # `scope_root` from `scope={"path": ...}` the same way, so a
+        # `local_model.py` R13 file-context fallback triggers identically
+        # whether a caller reaches `execute_chain()` through the MCP tool or
+        # through this HTTP route. Previously missing here, silently losing
+        # that fallback for every caller of this endpoint.
+        scope_root = (
+            Path(payload.scope["path"])
+            if isinstance(payload.scope, dict) and "path" in payload.scope
+            else None
+        )
+
         try:
             outcome = await chain.execute_chain(
                 resolved_task_type,
@@ -200,6 +233,7 @@ def build_delegate_internal_route(
                 registry=resolved_registry,
                 queue=queue,
                 graph_engine=graph_engine,
+                scope_root=scope_root,
                 client_factory=client_factory,
                 timeout=payload.timeout or timeout,
             )

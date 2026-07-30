@@ -50,11 +50,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from josu.config import JosuConfig
 from josu.config.orchestrator import OrchestratorAdapterConfig, usable_adapters
 from josu.daemon import DEFAULT_HOST, DEFAULT_PORT
+from josu.delegate.daemon_client import DaemonNotReachableError, check_daemon_reachable
 from josu.graph.build import GraphifyEngine
 from josu.graph.index import ReindexResult, reindex_on_merge
 from josu.observability.runlog import (
@@ -103,19 +102,6 @@ _ADAPTER_RUN_FUNCTIONS: dict[str, Callable[..., Any]] = {
 }
 
 
-class DaemonNotReachableError(RuntimeError):
-    """Raised when the josu daemon isn't reachable at `host:port` -- checked
-    BEFORE any worktree/git work, since the adapter's MCP manifest has to
-    point at a running daemon for the invocation to mean anything."""
-
-    def __init__(self, host: str, port: int) -> None:
-        self.host = host
-        self.port = port
-        super().__init__(
-            f"josu daemon not reachable at {host}:{port} -- start it with `josu daemon start`"
-        )
-
-
 class NoUsableAdapterError(RuntimeError):
     """Raised when no usable (parsed AND `mcp_approval_verified`-attested)
     `[[orchestrator.adapters]]` entry matches `adapter_name`, or when
@@ -148,19 +134,6 @@ class RunTaskResult:
     merge_result: MergeResult | None = None
     reindex_result: ReindexResult | None = None
     error: Exception | None = None
-
-
-def _check_daemon_reachable(host: str, port: int, *, timeout: float = 5.0) -> None:
-    """A bare HTTP request to the daemon's base URL -- any response (even a
-    404, since neither MCP server mounts a route at `/`) proves a listener
-    is actually there; a connection-level failure (`httpx.TransportError`,
-    covering both `ConnectError` and a timeout) means it isn't. Mirrors
-    `cli.py`'s `_cmd_delegate`'s own `httpx.TransportError`-catching
-    reachability pattern."""
-    try:
-        httpx.get(f"http://{host}:{port}/", timeout=timeout)
-    except httpx.TransportError as exc:
-        raise DaemonNotReachableError(host, port) from exc
 
 
 def _resolve_adapter_config(config: JosuConfig, adapter_name: str) -> OrchestratorAdapterConfig:
@@ -216,7 +189,7 @@ def run_task(
     `RunRecord` is created or saved for either) -- both are checked before
     any worktree/git work happens, so there's nothing yet to record.
     """
-    _check_daemon_reachable(host, port)
+    check_daemon_reachable(host, port)
     adapter = _resolve_adapter_config(config, adapter_name)
     run_fn = adapter_run if adapter_run is not None else _ADAPTER_RUN_FUNCTIONS.get(
         adapter_name, _ADAPTER_RUN_FUNCTIONS.get(adapter_name.replace("_", "-"))

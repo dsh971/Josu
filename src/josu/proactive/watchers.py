@@ -580,15 +580,25 @@ def _print_outcome(outcome: ProactiveCheckOutcome) -> None:
 
 _COMMIT_HOOK_TASK_TEXT = "Re-evaluate the repository for issues introduced by the most recent commit."
 
+# Simplify pass after U13/U14: a stuck daemon must not block `git commit`
+# for the same ~2-minute latency budget a general delegate call gets
+# (`daemon_client.post_delegate_internal()`'s own 120s default) -- this is a
+# bounded, local-only, low-complexity check, meant to be fast (see module
+# docstring). 20s is generous for that shape of call while still keeping
+# `git commit` responsive if the daemon is wedged.
+_COMMIT_HOOK_HTTP_TIMEOUT_SECONDS = 20.0
+
 
 def _run_commit_hook_from_cli() -> int:
     import asyncio
 
-    import httpx
-
     from josu.config import load_config, resolve_config_path
     from josu.daemon import DEFAULT_HOST, DEFAULT_PORT
-    from josu.delegate.internal_api import DELEGATE_INTERNAL_PATH
+    from josu.delegate.daemon_client import (
+        DaemonNotReachableError,
+        DelegateInternalError,
+        post_delegate_internal,
+    )
 
     config_path = resolve_config_path()
     config = load_config(config_path)
@@ -607,28 +617,22 @@ def _run_commit_hook_from_cli() -> int:
     candidates = list(local_registry.values())
     base_url = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
 
-    async def _call() -> httpx.Response:
-        async with httpx.AsyncClient(base_url=base_url, timeout=120.0) as client:
-            return await client.post(
-                DELEGATE_INTERNAL_PATH,
-                json={
+    try:
+        payload = asyncio.run(
+            post_delegate_internal(
+                base_url,
+                {
                     "task": _COMMIT_HOOK_TASK_TEXT,
                     "candidates": [candidate.model_dump() for candidate in candidates],
                 },
+                timeout=_COMMIT_HOOK_HTTP_TIMEOUT_SECONDS,
             )
-
-    try:
-        response = asyncio.run(_call())
-    except httpx.TransportError:
-        print(
-            f"josu proactive check: could not reach the josu daemon at {base_url} -- "
-            "start it with `josu daemon start`"
         )
+    except DaemonNotReachableError as exc:
+        print(f"josu proactive check: {exc}")
         return 1
-
-    payload = response.json()
-    if response.status_code >= 400:
-        print(f"josu proactive check: {payload.get('error', 'error')}: {payload.get('detail')}")
+    except DelegateInternalError as exc:
+        print(f"josu proactive check: {exc.error}: {exc.detail}")
         return 1
 
     result = DelegateResult(

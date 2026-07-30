@@ -276,7 +276,7 @@ def test_josu_delegate_cli_with_no_daemon_running_produces_clear_error(capsys):
 
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "could not reach the josu daemon" in captured.out
+    assert "josu daemon not reachable" in captured.out
     assert "josu daemon start" in captured.out
 
 
