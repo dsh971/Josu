@@ -17,18 +17,33 @@ validation convention -- never a bare unchecked dict):
 - `task_type` -- the general case (`josu delegate`): resolved against the
   daemon's real, already-loaded `chains_config`/`registry` via
   `delegate/chain.py`'s normal `execute_chain()` -> `resolve_chain()` path.
-- `candidates` -- a pre-resolved, already-local-only candidate list (the
-  commit hook's case). **This is the R39-preservation mechanism.**
+- `candidates` -- a pre-resolved, already-local-only candidate NAME list
+  (the commit hook's case). **This is the R39-preservation mechanism.**
   `proactive/watchers.py`'s `_local_only_execution_inputs()` still runs
   entirely client-side, exactly where it always has, BEFORE this endpoint
-  is ever called -- it is what produces this candidate list. This handler
-  never falls back to the daemon's real `chains_config`/`registry` for a
-  `candidates` request: it builds a throwaway, single-chain `ChainsConfig`
-  (`allow_remote=False`) from EXACTLY the candidates given, and additionally
-  drops any non-`local` candidate defensively (belt-and-suspenders: even a
-  future bug in a caller's own projection can't smuggle a remote candidate
-  through this path). A bare `task_type="proactive_check"` request would
-  resolve against the daemon's real config -- which may have
+  is ever called -- it is what produces this candidate list. Critically,
+  the request body carries ONLY names (`list[str]`), never full
+  `DelegateCandidate` objects: an unauthenticated local caller must never
+  be able to assert its own `endpoint`/`api_key_env`/`local` for a
+  candidate and have this handler trust it (that was a real SSRF /
+  credential-exfiltration hole -- a caller could name an
+  attacker-controlled `endpoint`, claim `local=True` to dodge R39's
+  intent, and point `api_key_env` at any environment variable it wanted
+  read and sent to that endpoint's Authorization header). Every name is
+  looked up in `registry` -- the SAME trusted, `josu.toml`-loaded registry
+  `execute_chain()` already uses for the general `task_type` path, passed
+  into `build_delegate_internal_route()` at daemon-construction time, never
+  reconstructed from the request body. A name that isn't in `registry`, or
+  that resolves to a candidate with `local=False` there, is silently
+  excluded (mirroring `config/chains.py`'s `_lookup_candidates()`
+  "unresolvable candidate is skipped, not an error" convention) -- never
+  trusted, never an error. This handler never falls back to the daemon's
+  real `chains_config` for resolving a `candidates` request's TASK TYPE
+  (it still builds a throwaway, single-chain `ChainsConfig`
+  (`allow_remote=False`) from exactly the resolved-and-verified local
+  candidates) -- but the candidates themselves now always come from
+  `registry`, never the request body. A bare `task_type="proactive_check"`
+  request would resolve against the daemon's real config -- which may have
   `allow_remote=true` set globally -- reintroducing exactly the unbounded
   remote-cost risk R39 exists to prevent; that's why the commit hook uses
   the `candidates` shape, never `task_type`.
@@ -100,7 +115,13 @@ class DelegateInternalRequest(BaseModel):
     task: str = Field(..., max_length=MAX_TASK_CHARS)
     scope: dict[str, Any] | None = None
     task_type: str | None = None
-    candidates: list[DelegateCandidate] | None = None
+    # NAME strings only -- never full `DelegateCandidate` objects. See
+    # module docstring's "candidates" bullet for why: accepting
+    # endpoint/api_key_env/local directly from an unauthenticated local
+    # caller was an SSRF/credential-exfiltration hole. Each name is
+    # resolved against the daemon's own trusted `registry` server-side,
+    # never taken at face value from the request body.
+    candidates: list[str] | None = None
     timeout: float | None = None
 
     @model_validator(mode="after")
@@ -184,14 +205,26 @@ def build_delegate_internal_route(
             return _error_response("invalid_request", errors, status_code=400)
 
         if payload.candidates:
-            # R39: build the resolution inputs from ONLY what the client
-            # supplied -- the daemon's real `chains_config`/`registry`
-            # (which may have `allow_remote=true` set globally) is never
-            # consulted for this request shape. The `local` filter here is
-            # a defensive second layer on top of the client's own
-            # `_local_only_execution_inputs()` projection, not a
-            # replacement for it.
-            local_candidates = [c for c in payload.candidates if c.local]
+            # SECURITY: `payload.candidates` is a list of NAME strings, never
+            # full `DelegateCandidate` objects -- an unauthenticated local
+            # caller's request body is NEVER trusted for a candidate's
+            # endpoint/api_key_env/local. Every name is resolved against
+            # `registry`, the SAME trusted, `josu.toml`-loaded registry
+            # `execute_chain()` uses for the general `task_type` path below
+            # (passed into `build_delegate_internal_route()` at
+            # daemon-construction time). A name absent from `registry`, or
+            # present but `local=False` there, is silently excluded --
+            # mirroring `config/chains.py`'s `_lookup_candidates()`
+            # "unresolvable candidate is skipped, not an error" convention.
+            # The request's real `chains_config` is still never consulted
+            # for RESOLVING this request's task type (that's the R39
+            # mechanism, unchanged) -- only `registry` is consulted, for
+            # verifying candidate identity/trust.
+            local_candidates = [
+                registry[name]
+                for name in payload.candidates
+                if name in registry and registry[name].local
+            ]
             resolved_task_type = _PRE_RESOLVED_CHAIN_KEY
             resolved_registry: Mapping[str, DelegateCandidate] = {
                 c.name: c for c in local_candidates

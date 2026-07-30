@@ -623,7 +623,12 @@ def _run_commit_hook_from_cli() -> int:
                 base_url,
                 {
                     "task": _COMMIT_HOOK_TASK_TEXT,
-                    "candidates": [candidate.model_dump() for candidate in candidates],
+                    # NAME strings only -- `internal_api.py`'s handler
+                    # resolves each against the daemon's own trusted
+                    # registry server-side; it never accepts a full
+                    # candidate object (endpoint/api_key_env/local) from
+                    # this request body (SSRF/credential-exfiltration fix).
+                    "candidates": [candidate.name for candidate in candidates],
                 },
                 timeout=_COMMIT_HOOK_HTTP_TIMEOUT_SECONDS,
             )

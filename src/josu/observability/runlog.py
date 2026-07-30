@@ -250,6 +250,19 @@ class RunRecord:
     reindexed_files: list[str] = field(default_factory=list)
     pruned_files: list[str] = field(default_factory=list)
 
+    # P1 fix: `RUN_OUTCOME_ERROR` previously carried no diagnostic detail at
+    # all -- `josu log <run_id>` showed only `outcome: error`, useless for
+    # debugging without external logs. Populated from `run.py`'s caught
+    # exception in its `finally` block: `error_class` is `type(exc).__name__`
+    # (a sanitized class name, matching `SkipEntry.error_class`'s existing
+    # convention elsewhere in this module -- never a raw traceback),
+    # `error_message` is `str(exc)`, truncated like every other
+    # caller-controllable text field this module stores. Both are `None`
+    # for every non-error outcome, and for any run that predates this field
+    # (an old-format record loaded via `from_dict()`).
+    error_class: str | None = None
+    error_message: str | None = None
+
     def record_graph_query(self, operation: str, query: str, result_count: int) -> GraphQueryEvent:
         event = GraphQueryEvent(operation=operation, query=_truncate(query), result_count=result_count)
         self.graph_queries.append(event)
@@ -269,17 +282,27 @@ class RunRecord:
         diverged_paths: Sequence[str] = (),
         reindexed_files: Sequence[str] = (),
         pruned_files: Sequence[str] = (),
+        error_class: str | None = None,
+        error_message: str | None = None,
     ) -> None:
         """U13: record the run's overall outcome (one of `RUN_OUTCOME_*`)
         plus whatever merge/reindex detail is relevant to it. Called exactly
         once, from `orchestrator/run.py`'s `run_task()` `finally` block, so
-        it always runs regardless of how the run concluded."""
+        it always runs regardless of how the run concluded.
+
+        `error_class`/`error_message` (P1 fix) are only ever populated by a
+        caller when `outcome == RUN_OUTCOME_ERROR` -- for every other
+        outcome they're left `None`, since the outcome-specific fields
+        (`diverged_paths`, `reindexed_files`, ...) already cover those
+        cases."""
         self.outcome = outcome
         if worktree_path is not None:
             self.worktree_path = worktree_path
         self.diverged_paths = list(diverged_paths)
         self.reindexed_files = list(reindexed_files)
         self.pruned_files = list(pruned_files)
+        self.error_class = error_class
+        self.error_message = _truncate(error_message) if error_message is not None else None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -306,6 +329,8 @@ class RunRecord:
             diverged_paths=list(data.get("diverged_paths", [])),
             reindexed_files=list(data.get("reindexed_files", [])),
             pruned_files=list(data.get("pruned_files", [])),
+            error_class=data.get("error_class"),
+            error_message=data.get("error_message"),
         )
 
 
@@ -405,6 +430,8 @@ def render_run(record: RunRecord) -> str:
             lines.append(f"    reindexed: {', '.join(record.reindexed_files)}")
         if record.pruned_files:
             lines.append(f"    pruned: {', '.join(record.pruned_files)}")
+        if record.error_class or record.error_message:
+            lines.append(f"    error: {record.error_class}: {record.error_message}")
 
     if not record.graph_queries and not record.delegations and not record.circuit_breaker_events:
         lines.append("  (no graph queries, delegations, or circuit-breaker events recorded)")

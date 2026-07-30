@@ -236,6 +236,20 @@ def test_full_run_approved_produces_worktree_adapter_diff_merge_and_saved_record
     assert loaded.worktree_path == str(result.worktree.path)
     assert loaded.task_description == "add a docstring"
 
+    # The worktree is auto-removed on a successful merge (P1 fix): gone
+    # from disk AND from git's own worktree bookkeeping, so U8's
+    # crash-recovery scan never mistakenly treats a normal, successful run
+    # as a crash orphan.
+    assert not result.worktree.path.exists()
+    worktree_list = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert str(result.worktree.path) not in worktree_list
+
 
 # --- developer-rejected diff: no merge, still a saved record ----------------
 
@@ -275,6 +289,18 @@ def test_developer_rejected_diff_produces_a_saved_record_with_no_merge(
 
     loaded = load_run(result.run_id, tmp_path / "runlog")
     assert loaded.outcome == RUN_OUTCOME_REJECTED
+
+    # The worktree is auto-removed on a developer rejection too (P1 fix):
+    # gone from disk AND from git's own worktree bookkeeping.
+    assert not result.worktree.path.exists()
+    worktree_list = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert str(result.worktree.path) not in worktree_list
 
 
 # --- circuit-breaker timeout: saved record, worktree left for U8 cleanup ----
@@ -532,3 +558,50 @@ def test_no_usable_adapter_configured_raises_a_clear_actionable_error(
             host=host,
             port=port,
         )
+
+
+# --- an unexpected exception still saves a record, now WITH diagnostic detail -
+
+
+def test_unexpected_exception_from_the_adapter_saves_an_error_record_with_diagnostic_detail(
+    git_repo, tmp_path, fake_daemon, engine, config
+):
+    """P1 fix: `RUN_OUTCOME_ERROR` previously saved with no diagnostic
+    detail at all. An adapter raising something unexpected (not
+    `CircuitBreakerTimeoutError`/`DivergedWorkingTreeError`, both handled
+    specially) is still re-raised out of `run_task()` (unchanged, existing
+    behavior -- the `finally` block always saves a record first), but the
+    saved `RunRecord` now carries `error_class`/`error_message` describing
+    exactly what went wrong, not just a bare `outcome: error`."""
+    host, port = fake_daemon
+    engine.build(git_repo)
+
+    def _exploding_adapter(adapter, *, worktree, manifest, config_path, task, timeout=None):
+        raise RuntimeError("simulated daemon crash mid-run")
+
+    with pytest.raises(RuntimeError, match="simulated daemon crash mid-run"):
+        run_task(
+            "a task whose adapter blows up unexpectedly",
+            config=config,
+            repo_root=git_repo,
+            engine=engine,
+            approve=lambda diff: True,
+            worktrees_dir=tmp_path / "worktrees",
+            runlog_dir=tmp_path / "runlog",
+            adapter_run=_exploding_adapter,
+            host=host,
+            port=port,
+        )
+
+    # The record was still saved (the `finally` block always runs) --
+    # find it by scanning the runlog dir directly, since `run_task()`
+    # raised before returning a `RunTaskResult` with a `run_id` to look up.
+    from josu.observability.runlog import RUN_OUTCOME_ERROR, list_runs
+
+    run_ids = list_runs(tmp_path / "runlog")
+    assert len(run_ids) == 1
+    loaded = load_run(run_ids[0], tmp_path / "runlog")
+
+    assert loaded.outcome == RUN_OUTCOME_ERROR
+    assert loaded.error_class == "RuntimeError"
+    assert loaded.error_message == "simulated daemon crash mid-run"

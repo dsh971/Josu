@@ -130,6 +130,49 @@ def test_chain_exhausted_is_a_distinguishable_outcome_not_generic_failure(tmp_pa
     assert "remote-fallback" in rendered
 
 
+def test_error_outcome_persists_exception_class_and_message(tmp_path):
+    """P1 fix: a run that ends in `RUN_OUTCOME_ERROR` (e.g. the daemon
+    crashes mid-run) previously saved with NO diagnostic detail at all --
+    `josu log <run_id>` showed only `outcome: error`. `record_outcome()`
+    now accepts `error_class`/`error_message`, persists them, and
+    `render_run()` surfaces them."""
+    from josu.observability.runlog import RUN_OUTCOME_ERROR
+
+    record = RunRecord(run_id="run-errored")
+    record.record_outcome(
+        RUN_OUTCOME_ERROR,
+        error_class="MCPServerConnectionError",
+        error_message="daemon crashed mid-run: connection reset",
+    )
+    save_run(record, tmp_path)
+
+    loaded = load_run("run-errored", tmp_path)
+    assert loaded.outcome == RUN_OUTCOME_ERROR
+    assert loaded.error_class == "MCPServerConnectionError"
+    assert loaded.error_message == "daemon crashed mid-run: connection reset"
+
+    rendered = render_run(loaded)
+    assert "MCPServerConnectionError" in rendered
+    assert "daemon crashed mid-run: connection reset" in rendered
+
+
+def test_non_error_outcomes_leave_error_detail_unset(tmp_path):
+    """`error_class`/`error_message` are only ever populated for
+    `RUN_OUTCOME_ERROR` -- every other outcome (merged, rejected, ...)
+    leaves both `None`, since those already have their own dedicated
+    fields for "what happened"."""
+    from josu.observability.runlog import RUN_OUTCOME_MERGED
+
+    record = RunRecord(run_id="run-merged-clean")
+    record.record_outcome(RUN_OUTCOME_MERGED, worktree_path="/tmp/some-worktree")
+    save_run(record, tmp_path)
+
+    loaded = load_run("run-merged-clean", tmp_path)
+    assert loaded.error_class is None
+    assert loaded.error_message is None
+    assert "error:" not in render_run(loaded)
+
+
 def test_circuit_breaker_trip_shows_which_limit_tripped_and_why(tmp_path):
     error = CircuitBreakerTimeoutError(timeout_seconds=1200.0, elapsed_seconds=1215.7)
     cb_event = CircuitBreakerEvent.from_timeout_error(error)

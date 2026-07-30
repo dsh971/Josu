@@ -443,6 +443,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except NoUsableAdapterError as exc:
         print(f"josu run: {exc}")
         return 1
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad: any other
+        # failure `run_task()` doesn't already surface via one of the
+        # specific types above (e.g. `MCPServerConnectionError` if the
+        # daemon crashes mid-run, `GitAllowlistViolationError`,
+        # `ConfigPathStagedError`) must still fail with this file's
+        # standard clean `josu run: <message>` shape, never an uncaught
+        # traceback -- matching every other subcommand's error-handling
+        # convention in this file.
+        print(f"josu run: {exc}")
+        return 1
 
     print(f"josu run: run {result.run_id} finished (see `josu log {result.run_id}` for details)")
 

@@ -30,7 +30,18 @@ this follows):
    `approve()` callback's answer (`merge.merge()`).
 6. On a successful merge, the changed-path reindex
    (`graph.index.reindex_on_merge()`) -- derives its own changed-path list
-   from the merge result; nothing is passed in from here (R14).
+   from the merge result; nothing is passed in from here (R14). The
+   worktree is removed (`worktree.remove_worktree()`) immediately
+   afterward -- AFTER reindexing, never before, since
+   `reindex_on_merge()`'s own diff computation reads from the worktree's
+   working tree via `git`. A developer-rejected diff (no merge to reindex)
+   has its worktree removed right after the rejection is determined,
+   before returning. Both are terminal "nothing more to do with this
+   worktree" states, per the plan's "auto-delete on merge/rejection only"
+   requirement. A circuit-breaker timeout or any other unexpected
+   exception deliberately does NOT remove the worktree -- U8's
+   crash-recovery/cleanup path (`josu cleanup`) is what surfaces and
+   disposes of those, never a silent discard here.
 
 A `RunRecord` (U6) is created up front and saved via `observability.runlog.
 save_run()` in a `finally` block, so success, a developer-rejected diff, a
@@ -83,7 +94,12 @@ from josu.orchestrator.merge import (
     snapshot_repo,
 )
 from josu.orchestrator.mcp_manifest import MCPManifest, validate_manifest, write_manifest
-from josu.orchestrator.worktree import Worktree, create_worktree, default_worktrees_dir
+from josu.orchestrator.worktree import (
+    Worktree,
+    create_worktree,
+    default_worktrees_dir,
+    remove_worktree,
+)
 
 # The adapter dispatch table: `adapter_name` -> the module-level `run()`
 # callable that actually invokes that CLI. Only Claude Code exists today
@@ -282,6 +298,13 @@ def run_task(
 
         if not merge_result.merged:
             outcome = RUN_OUTCOME_REJECTED
+            # Terminal state (developer rejected the diff) -- auto-delete
+            # the worktree now, matching the plan's "auto-delete on
+            # merge/rejection only" requirement (see module docstring).
+            # `force=True`: the worktree carries the adapter's rejected
+            # (never merged) edits, uncommitted -- `git worktree remove`
+            # refuses a dirty worktree without `--force`.
+            remove_worktree(worktree, force=True)
             return RunTaskResult(
                 run_id=record.run_id,
                 record=record,
@@ -296,6 +319,16 @@ def run_task(
         # from here (R14).
         reindex_result = reindex_on_merge(engine, worktree, merge_result)
         outcome = RUN_OUTCOME_MERGED
+        # Terminal state (merged) -- auto-delete the worktree now, AFTER
+        # reindexing (which still needs to read the worktree's working
+        # tree via git), matching the plan's "auto-delete on
+        # merge/rejection only" requirement (see module docstring).
+        # `force=True`: the worktree always carries uncommitted changes at
+        # this point (the adapter's own edits) -- that's expected, not a
+        # sign anything is wrong, since its diff has already been applied
+        # to `repo_root` by `merge()` above; `git worktree remove` refuses
+        # a dirty worktree without `--force`.
+        remove_worktree(worktree, force=True)
         return RunTaskResult(
             run_id=record.run_id,
             record=record,
@@ -310,11 +343,22 @@ def run_task(
         error = exc
         raise
     finally:
+        # P1 fix: `RUN_OUTCOME_ERROR` previously saved with no diagnostic
+        # detail at all -- populate `error_class`/`error_message` from the
+        # exception this block's own `except` clause caught, so `josu log
+        # <run_id>` has something to show beyond a bare `outcome: error`.
+        # Only set for the actual error outcome -- the other outcomes
+        # (`DIVERGED`, `CIRCUIT_BREAKER_TIMEOUT`) already have their own
+        # dedicated fields (`diverged_paths`, `circuit_breaker_events`) for
+        # this same "what happened" detail.
+        is_error_outcome = outcome == RUN_OUTCOME_ERROR and error is not None
         record.record_outcome(
             outcome,
             worktree_path=str(worktree.path) if worktree is not None else None,
             diverged_paths=list(getattr(error, "diverged_paths", None) or []),
             reindexed_files=reindex_result.reindexed_files if reindex_result else [],
             pruned_files=reindex_result.pruned_files if reindex_result else [],
+            error_class=type(error).__name__ if is_error_outcome else None,
+            error_message=str(error) if is_error_outcome else None,
         )
         save_run(record, resolved_runlog_dir)

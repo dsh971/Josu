@@ -27,12 +27,20 @@ lives now:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
 
 from josu.delegate.internal_api import DELEGATE_INTERNAL_PATH
+
+# How much of a non-JSON response body to include in `DelegateInternalError`'s
+# fallback message -- generous enough to show a caller what actually came
+# back (e.g. the start of an HTML error page or a bare traceback string from
+# Starlette's default error handler), bounded so a huge/binary body never
+# blows up the error message itself.
+_MAX_RAW_BODY_CHARS_IN_ERROR = 500
 
 
 class DaemonNotReachableError(RuntimeError):
@@ -103,8 +111,16 @@ async def post_delegate_internal(
 
     Raises `DaemonNotReachableError` on a transport-level failure (the
     daemon isn't running/reachable at `base_url`), or `DelegateInternalError`
-    on a non-2xx structured error response. Returns the parsed JSON body on
-    success (2xx).
+    on a non-2xx response -- either `internal_api.py`'s own structured
+    `{"error": ..., "detail": ...}` body, or (P2 fix) a non-JSON body from
+    some OTHER failure mode entirely (e.g. an unhandled exception inside
+    `execute_chain()` that isn't a `DelegateError` subclass, hitting
+    Starlette's default error handler, which doesn't return JSON at all).
+    Without this guard, `response.json()` would raise an uncaught
+    `json.JSONDecodeError` that bypasses both `DaemonNotReachableError` and
+    `DelegateInternalError`, surfacing a raw traceback at every call site
+    that expects one of this module's own clean error types. Returns the
+    parsed JSON body on success (2xx).
     """
     try:
         async with httpx.AsyncClient(base_url=base_url, timeout=timeout) as client:
@@ -112,7 +128,17 @@ async def post_delegate_internal(
     except httpx.TransportError as exc:
         raise DaemonNotReachableError.from_base_url(base_url) from exc
 
-    data: dict[str, Any] = response.json()
+    try:
+        data: dict[str, Any] = response.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raw_text = response.text[:_MAX_RAW_BODY_CHARS_IN_ERROR]
+        raise DelegateInternalError(
+            "non_json_response",
+            f"daemon responded with status {response.status_code} and a non-JSON body: "
+            f"{raw_text!r}",
+            status_code=response.status_code,
+        ) from exc
+
     if response.status_code >= 400:
         raise DelegateInternalError(
             data.get("error", "error"), data.get("detail"), status_code=response.status_code
