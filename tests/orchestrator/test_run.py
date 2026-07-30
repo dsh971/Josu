@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import socket
 import subprocess
+import sys
 import threading
+import time
 from contextlib import closing
 from datetime import date
 from pathlib import Path
@@ -353,6 +355,92 @@ def test_circuit_breaker_timeout_produces_saved_record_and_leaves_worktree(
         text=True,
     ).stdout
     assert str(result.worktree.path) in worktree_list
+
+    loaded = load_run(result.run_id, tmp_path / "runlog")
+    assert loaded.outcome == RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT
+    assert len(loaded.circuit_breaker_events) == 1
+
+
+# --- P3 fix: a hang during worktree creation (steps 1-3) is also caught ----
+
+
+def test_hang_during_worktree_creation_is_caught_by_the_circuit_breaker(
+    git_repo, tmp_path, fake_daemon, engine, adapter_config, monkeypatch
+):
+    """P3 fix (U13/U14 Tier 2 review): previously, worktree creation/the R21
+    snapshot/MCP manifest generation (steps 1-3) ran with NO timeout
+    coverage at all -- only the adapter invocation (step 4) was wrapped by
+    the circuit breaker, so a `git` lock-contention hang during worktree
+    creation could hang the WHOLE `josu run` invocation indefinitely.
+
+    Proven with a REAL slow subprocess standing in for a wedged `git` call
+    (mirroring `test_circuit_breaker.py`'s own "a real subprocess that
+    would sleep past the budget" convention for proving
+    `run_under_circuit_breaker()`'s actual timeout mechanism, not a
+    hand-raised exception standing in for it) -- `worktree.create_worktree`
+    is patched to run a real `python -c "time.sleep(5)"` subprocess with the
+    circuit breaker's own tiny remaining budget as its `timeout=`, so a REAL
+    `subprocess.TimeoutExpired` fires well before the fake 5s sleep
+    completes, exactly as a genuinely wedged `git` call inside
+    `worktree.py`'s own `_run_git()` would produce now that `timeout` is
+    threaded through it."""
+    host, port = fake_daemon
+    engine.build(git_repo)
+
+    def _hanging_create_worktree(
+        repo_root, worktrees_dir, *, name=None, task_description=None, timeout=None
+    ):
+        subprocess.run(
+            [sys.executable, "-c", "import time; time.sleep(5)"],
+            timeout=timeout,
+            check=True,
+        )
+        raise AssertionError("the fake slow subprocess must time out before reaching this line")
+
+    monkeypatch.setattr("josu.orchestrator.run.create_worktree", _hanging_create_worktree)
+
+    def _adapter_should_never_run(adapter, *, worktree, manifest, config_path, task, timeout=None):
+        raise AssertionError(
+            "the adapter must never run -- the circuit breaker must trip during the "
+            "worktree-creation hang, before step 4 is ever reached"
+        )
+
+    def _approve_should_never_be_called(diff: str) -> bool:
+        raise AssertionError("approve() must not be called after a circuit-breaker trip")
+
+    tiny_timeout_config = JosuConfig(
+        path=Path("/nonexistent/josu.toml"),
+        delegate=DelegateConfig(),
+        chains=ChainsConfig(),
+        orchestrator=OrchestratorConfig(adapters=[adapter_config]),
+        wall_clock_timeout_seconds=0.2,
+    )
+
+    start = time.monotonic()
+    result = run_task(
+        "a task whose worktree creation hangs",
+        config=tiny_timeout_config,
+        repo_root=git_repo,
+        engine=engine,
+        approve=_approve_should_never_be_called,
+        worktrees_dir=tmp_path / "worktrees",
+        runlog_dir=tmp_path / "runlog",
+        adapter_run=_adapter_should_never_run,
+        host=host,
+        port=port,
+    )
+    elapsed = time.monotonic() - start
+
+    # Caught well short of the fake call's full 5s sleep -- the whole
+    # invocation returned, it did not hang.
+    assert elapsed < 5.0
+
+    assert result.outcome == RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT
+    assert result.merge_result is None
+    # `create_worktree()` never actually returned a `Worktree` (it hung, was
+    # killed, and the timeout propagated) -- nothing to leave behind for U8
+    # cleanup from THIS run's own bookkeeping in this case.
+    assert result.worktree is None
 
     loaded = load_run(result.run_id, tmp_path / "runlog")
     assert loaded.outcome == RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT

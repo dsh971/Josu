@@ -88,10 +88,20 @@ class DivergedWorkingTreeError(MergeError):
         )
 
 
-def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+def _run_git(
+    args: list[str], *, cwd: Path, timeout: float | None = None
+) -> subprocess.CompletedProcess[str]:
     """Run a git subcommand as an argv list (`shell=False`), never a shell
     string -- mirrors `worktree.py`'s and `adapter.py`'s subprocess-safety
-    contract."""
+    contract.
+
+    `timeout` (P3 fix, U13/U14 Tier 2 review): mirrors `worktree.py`'s own
+    `_run_git()` -- forwarded to `subprocess.run(..., timeout=...)`,
+    `None` by default (unbounded, unchanged for every caller that doesn't
+    pass one). A `subprocess.TimeoutExpired` is deliberately left
+    uncaught here so `orchestrator/circuit_breaker.py`'s
+    `run_under_circuit_breaker()` can translate it into a
+    `CircuitBreakerTimeoutError`."""
     subcommand = args[0] if args else ""
     if subcommand not in _GIT_MERGE_SUBCOMMANDS:
         raise MergeError(
@@ -106,6 +116,7 @@ def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
             capture_output=True,
             text=True,
             check=True,
+            timeout=timeout,
         )
     except subprocess.CalledProcessError as exc:
         raise MergeError(
@@ -127,13 +138,18 @@ class RepoSnapshot:
     stash_ref: str | None
 
 
-def snapshot_repo(repo_root: Path, *, stash_ref: str | None) -> RepoSnapshot:
+def snapshot_repo(
+    repo_root: Path, *, stash_ref: str | None, timeout: float | None = None
+) -> RepoSnapshot:
     """Capture `repo_root`'s current HEAD sha as a `RepoSnapshot`, paired
     with `stash_ref` (the same value `create_worktree()` returned on its
     `Worktree`). Callers are expected to call this immediately after
     `create_worktree()`, before anything else touches `repo_root`, so the
-    snapshot is a true "as of worktree creation" baseline."""
-    head = _run_git(["rev-parse", "HEAD"], cwd=repo_root).stdout.strip()
+    snapshot is a true "as of worktree creation" baseline.
+
+    `timeout` (P3 fix): forwarded to the underlying `git rev-parse HEAD`
+    call -- `None` by default (unbounded, unchanged)."""
+    head = _run_git(["rev-parse", "HEAD"], cwd=repo_root, timeout=timeout).stdout.strip()
     return RepoSnapshot(head=head, stash_ref=stash_ref)
 
 

@@ -76,9 +76,23 @@ class Worktree:
     task_description: str | None = None
 
 
-def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+def _run_git(
+    args: list[str], *, cwd: Path, timeout: float | None = None
+) -> subprocess.CompletedProcess[str]:
     """Run a git subcommand as an argv list (`shell=False`), never a shell
     string -- mirrors `orchestrator/adapter.py`'s subprocess-safety contract.
+
+    `timeout` (P3 fix, U13/U14 Tier 2 review): passed straight through to
+    `subprocess.run(..., timeout=...)` -- `None` (the default) preserves the
+    original unbounded-wait behavior for every caller that doesn't pass one.
+    A `subprocess.TimeoutExpired` this raises is deliberately NOT caught
+    here (unlike `CalledProcessError`/`FileNotFoundError` just below) --
+    it's left to propagate unwrapped to the caller, exactly like
+    `orchestrator/adapter.py`'s own subprocess invocation already does, so
+    `orchestrator/circuit_breaker.py`'s `run_under_circuit_breaker()` can
+    catch it and translate it into a `CircuitBreakerTimeoutError` -- a git
+    lock-contention hang during worktree creation is now bounded by the
+    same wall-clock budget as the adapter invocation, not left unbounded.
     """
     subcommand = args[0] if args else ""
     if subcommand not in _GIT_LIFECYCLE_SUBCOMMANDS:
@@ -94,6 +108,7 @@ def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
             capture_output=True,
             text=True,
             check=True,
+            timeout=timeout,
         )
     except subprocess.CalledProcessError as exc:
         raise WorktreeError(
@@ -109,6 +124,7 @@ def create_worktree(
     *,
     name: str | None = None,
     task_description: str | None = None,
+    timeout: float | None = None,
 ) -> Worktree:
     """Create a new, isolated git worktree under `worktrees_dir`, seeded with
     the developer's current state including uncommitted changes -- never
@@ -126,22 +142,32 @@ def create_worktree(
        working tree and index are never modified by any of this -- `stash
        create` doesn't touch them, and `stash apply` only ever runs against
        the new worktree's path.
+
+    `timeout` (P3 fix): forwarded as-is to each of the (up to three) git
+    subprocess calls above via `_run_git()`'s own `timeout` parameter --
+    `None` (the default) means unbounded, matching the original behavior.
+    Not decremented between calls (each call gets the same budget) -- a
+    reasonable approximation given these are ordinarily sub-second git
+    operations; the actual threat this closes is any ONE of them hanging
+    indefinitely on lock contention, which `subprocess.run(timeout=...)`
+    catches regardless.
     """
     worktrees_dir.mkdir(parents=True, exist_ok=True)
     worktree_name = name or f"josu-{uuid.uuid4().hex[:12]}"
     worktree_path = worktrees_dir / worktree_name
     branch = f"josu/{worktree_name}"
 
-    stash_result = _run_git(["stash", "create"], cwd=repo_root)
+    stash_result = _run_git(["stash", "create"], cwd=repo_root, timeout=timeout)
     stash_ref = stash_result.stdout.strip() or None
 
     _run_git(
         ["worktree", "add", "-b", branch, str(worktree_path), "HEAD"],
         cwd=repo_root,
+        timeout=timeout,
     )
 
     if stash_ref:
-        _run_git(["stash", "apply", stash_ref], cwd=worktree_path)
+        _run_git(["stash", "apply", stash_ref], cwd=worktree_path, timeout=timeout)
 
     return Worktree(
         path=worktree_path,

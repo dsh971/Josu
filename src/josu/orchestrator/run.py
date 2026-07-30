@@ -219,6 +219,8 @@ def run_task(
     record = RunRecord(run_id=new_run_id(), task_description=task_description or task)
 
     worktree: Worktree | None = None
+    snapshot: RepoSnapshot | None = None
+    manifest: MCPManifest | None = None
     diff: str | None = None
     merge_result: MergeResult | None = None
     reindex_result: ReindexResult | None = None
@@ -226,24 +228,69 @@ def run_task(
     error: Exception | None = None
 
     try:
-        # Step 1: an isolated worktree, seeded from repo_root's current state.
-        worktree = create_worktree(
-            repo_root, resolved_worktrees_dir, task_description=task_description or task
-        )
-
-        # Step 2 -- MUST happen immediately after worktree creation, before
-        # anything else runs. See module docstring.
-        snapshot: RepoSnapshot = snapshot_repo(worktree.repo_root, stash_ref=worktree.stash_ref)
-
-        # Step 3: the per-worktree MCP manifest, generated then validated.
-        manifest: MCPManifest = write_manifest(
-            worktree.path, host, port, manifests_dir=manifests_dir
-        )
-        validate_manifest(manifest)
-
-        # Step 4: the circuit-breaker-wrapped adapter invocation.
+        # P3 fix (U13/U14 Tier 2 review): steps 1-3 (worktree creation, the
+        # R21 snapshot, MCP manifest generation+validation) used to run with
+        # NO timeout coverage at all -- only step 4 (the adapter invocation)
+        # was wrapped by the circuit breaker. `worktree.py`'s/`merge.py`'s
+        # own git subprocess calls had no `timeout=` passed to
+        # `subprocess.run` whatsoever, so a git lock-contention hang during
+        # worktree creation could hang the WHOLE `josu run` invocation
+        # indefinitely, well before the adapter step's own circuit-breaker
+        # wrapping ever got a chance to matter.
+        #
+        # Fix: create ONE `CircuitBreaker` up front and wrap BOTH this
+        # prep sequence and the step-4 adapter call (below) with it, rather
+        # than giving steps 1-3 their own separate, smaller timeout.
+        # `run_under_circuit_breaker()`'s `breaker.start()` is idempotent,
+        # so the two calls share one continuous wall-clock budget: prep
+        # time is deliberately counted AGAINST the same budget the adapter
+        # gets, not on top of it -- a slow/hanging worktree/snapshot/
+        # manifest step now eats into the adapter's own effective timeout
+        # exactly the way a slow adapter step already would, rather than
+        # silently getting its own separate allowance. This was chosen over
+        # a second, independent timeout around steps 1-3 because
+        # `config.wall_clock_timeout_seconds` is documented (R23) as THE
+        # single whole-run budget -- introducing a second, separate knob
+        # here would fragment that single-budget contract for no clear
+        # benefit, and every existing test configures a generous enough
+        # budget that real (non-hanging) worktree/snapshot/manifest prep
+        # time is negligible against it.
         breaker = CircuitBreaker(config.wall_clock_timeout_seconds)
         try:
+
+            def _prepare_worktree_snapshot_and_manifest(remaining: float) -> None:
+                nonlocal worktree, snapshot, manifest
+                # Step 1: an isolated worktree, seeded from repo_root's
+                # current state. `timeout=remaining` bounds each of its own
+                # (up to three) git subprocess calls -- see
+                # `worktree.py`'s `create_worktree()`/`_run_git()` docstrings.
+                worktree = create_worktree(
+                    repo_root,
+                    resolved_worktrees_dir,
+                    task_description=task_description or task,
+                    timeout=remaining,
+                )
+
+                # Step 2 -- MUST happen immediately after worktree creation,
+                # before anything else runs. See module docstring.
+                snapshot = snapshot_repo(
+                    worktree.repo_root, stash_ref=worktree.stash_ref, timeout=remaining
+                )
+
+                # Step 3: the per-worktree MCP manifest, generated then
+                # validated -- pure file I/O, no subprocess/timeout
+                # plumbing needed.
+                manifest = write_manifest(
+                    worktree.path, host, port, manifests_dir=manifests_dir
+                )
+                validate_manifest(manifest)
+
+            run_under_circuit_breaker(breaker, _prepare_worktree_snapshot_and_manifest)
+
+            # Step 4: the circuit-breaker-wrapped adapter invocation, reusing
+            # the SAME `breaker` (and therefore the budget steps 1-3 above
+            # already started consuming).
+            #
             # The return value (a `ClaudeCodeRunResult`-shaped object) is
             # deliberately not captured here -- its only role in this
             # composition is proving the invocation completed without

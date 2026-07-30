@@ -17,14 +17,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import stat
 import subprocess
+import threading
 import time
 from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 
+import josu.proactive.watchers as watchers_module
 from josu.config.chains import (
     PROACTIVE_CHECK_TASK_TYPE,
     ChainsConfig,
@@ -363,6 +367,130 @@ def test_local_only_projection_returns_none_when_no_local_candidate_exists():
 
     assert projected_config is None
     assert projected_registry == {}
+
+
+# --- Testing gap 4b: the commit-hook HTTP timeout actually fires against
+# a wedged daemon and degrades gracefully ------------------------------------
+
+
+@pytest.fixture
+def wedged_daemon():
+    """A real, bound TCP listener that accepts a connection and then never
+    responds at all (no bytes sent back, ever) -- standing in for a josu
+    daemon process that's alive at the TCP level (so a bare connection
+    doesn't get refused) but wedged -- deadlocked, stuck in an infinite
+    loop, whatever the cause -- and never answers. Used to prove
+    `post_delegate_internal()`'s real `httpx` read-timeout mechanism
+    actually fires against a genuinely non-responding peer, not a mocked
+    one. Mirrors `tests/orchestrator/test_run.py`'s `fake_daemon` fixture
+    shape, but deliberately never writes a response."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(5)
+    host, port = server.getsockname()
+
+    stop = threading.Event()
+
+    def _serve():
+        with closing(server):
+            server.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    conn, _ = server.accept()
+                except socket.timeout:
+                    continue
+                # Accept the connection, then do nothing -- never read the
+                # request, never write a response. The client's own request
+                # just sits there until ITS OWN timeout fires.
+                with closing(conn):
+                    while not stop.is_set():
+                        time.sleep(0.05)
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    try:
+        yield host, port
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+
+
+def test_commit_hook_http_timeout_fires_against_a_wedged_daemon_and_degrades_gracefully(
+    tmp_path, monkeypatch, wedged_daemon, capsys
+):
+    """[Testing gap 4b] `proactive/watchers.py`'s commit-hook entry point
+    (`_run_commit_hook_from_cli()`) trims its daemon-call timeout to 20s
+    specifically so a wedged daemon never blocks `git commit` for the
+    general delegate call's own ~2-minute budget (see
+    `_COMMIT_HOOK_HTTP_TIMEOUT_SECONDS`'s own module comment, and the
+    module docstring's "never block the commit" philosophy).
+
+    Proven here against a REAL TCP listener (`wedged_daemon`) that accepts a
+    connection and then never responds -- not a mock of `httpx`'s timeout
+    logic itself. `_COMMIT_HOOK_HTTP_TIMEOUT_SECONDS` is patched down to a
+    small value purely so this test doesn't have to wait out the real 20s
+    to prove the plumbing works; the mechanism actually exercised is real
+    end to end: a real socket, real `httpx` read-timeout enforcement inside
+    `post_delegate_internal()`, its `except httpx.TransportError`
+    translating that into `DaemonNotReachableError` (a timeout IS a
+    `TransportError` in httpx's own exception hierarchy), and
+    `_run_commit_hook_from_cli()`'s `except DaemonNotReachableError`
+    handling it by printing a message and returning a non-zero exit code --
+    never hanging, never an uncaught exception."""
+    host, port = wedged_daemon
+
+    config_home = tmp_path / "config-home"
+    config_dir = config_home / "josu"
+    config_dir.mkdir(parents=True)
+    (config_dir / "josu.toml").write_text(
+        """
+[[delegate.candidates]]
+name = "local-c"
+endpoint = "http://localhost:11434/v1"
+local = true
+model = "qwen2.5-coder:7b"
+
+[[delegation.chains]]
+task_type = "proactive_check"
+candidates = ["local-c"]
+""",
+        encoding="utf-8",
+    )
+    # `resolve_config_path()` (`config/__init__.py`) respects
+    # `$XDG_CONFIG_HOME` -- points the commit hook's own config load at the
+    # fixture file above instead of the real developer machine's config.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+
+    # `_run_commit_hook_from_cli()` does `from josu.daemon import
+    # DEFAULT_HOST, DEFAULT_PORT` freshly at call time -- patching the
+    # module attributes here is picked up by that fresh import, pointing
+    # the commit hook at the wedged daemon fixture instead of the real
+    # default port.
+    import josu.daemon as daemon_module
+
+    monkeypatch.setattr(daemon_module, "DEFAULT_HOST", host)
+    monkeypatch.setattr(daemon_module, "DEFAULT_PORT", port)
+
+    # Trim the real 20s constant down for the test -- the SAME real,
+    # httpx-over-a-real-socket timeout mechanism fires, just against a
+    # much shorter budget so the test stays fast. Not a mock of the timeout
+    # mechanism itself (no `httpx`/`asyncio` internals are patched).
+    monkeypatch.setattr(watchers_module, "_COMMIT_HOOK_HTTP_TIMEOUT_SECONDS", 0.3)
+
+    start = time.monotonic()
+    exit_code = watchers_module._run_commit_hook_from_cli()
+    elapsed = time.monotonic() - start
+
+    # Handled gracefully: a clean non-zero exit and a printed message, never
+    # an uncaught exception -- and returned promptly, nowhere near the real
+    # 20s default, let alone hanging indefinitely.
+    assert exit_code == 1
+    assert elapsed < 5.0
+
+    captured = capsys.readouterr()
+    assert "josu proactive check" in captured.out
+    assert "daemon" in captured.out.lower()
 
 
 # --- Test scenario: `josu init` on a repo with an existing post-commit

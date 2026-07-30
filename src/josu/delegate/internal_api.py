@@ -164,11 +164,11 @@ def build_delegate_internal_route(
     async def handle(request: Request) -> JSONResponse:
         # Check the declared `Content-Length` FIRST, before ever reading the
         # body -- an oversized request is rejected without buffering it into
-        # memory at all. The post-read length check just below remains as a
-        # fallback for a chunked request with no `Content-Length` header (a
-        # declared size isn't guaranteed to be present or honest, so both
-        # checks are needed; this one just avoids the common case where the
-        # header IS present and already tells us enough to reject early).
+        # memory at all. This is only a fast path for the common case where
+        # the header IS present and already tells us enough to reject early;
+        # it is NOT a substitute for the streaming cap below, since a
+        # declared size isn't guaranteed to be present (chunked
+        # transfer-encoding sends none at all) or honest.
         declared_length = request.headers.get("content-length")
         if declared_length is not None:
             try:
@@ -182,13 +182,51 @@ def build_delegate_internal_route(
                     status_code=413,
                 )
 
-        body_bytes = await request.body()
-        if len(body_bytes) > MAX_BODY_BYTES:
+        # SECURITY (defense-in-depth, not a complete CSRF fix): require a
+        # real `application/json` Content-Type. This endpoint is reachable
+        # by anything on the loopback interface (see module docstring's
+        # "Trust boundary" section), which includes a browser tab that got a
+        # victim to issue a request to `localhost` -- a "simple request"
+        # (no-CORS-preflight) form submission or `fetch()` call can send NO
+        # Content-Type, or a non-JSON one (`text/plain`, `multipart/
+        # form-data`, `application/x-www-form-urlencoded`) without
+        # triggering a CORS preflight, but CANNOT set an arbitrary
+        # Content-Type without one. Requiring `application/json` here means
+        # a browser attempting that attack either can't reach this branch at
+        # all, or must first trigger a preflight the browser will actually
+        # enforce. This does NOT fully close the CSRF surface on its own --
+        # a real `application/json` XHR/fetch from a malicious page is still
+        # possible in some configurations (no CORS response headers are
+        # checked before the request lands here) -- it only raises the bar
+        # against the cheap, no-preflight "simple request" shape.
+        content_type = request.headers.get("content-type", "")
+        if content_type.split(";")[0].strip().lower() != "application/json":
             return _error_response(
-                "request_too_large",
-                f"request body exceeds the maximum of {MAX_BODY_BYTES} bytes",
-                status_code=413,
+                "unsupported_media_type",
+                "Content-Type must be application/json",
+                status_code=415,
             )
+
+        # Read the body INCREMENTALLY via `request.stream()`, never
+        # `request.body()` -- a request that declares no `Content-Length`
+        # at all (chunked transfer-encoding) must still never be fully
+        # buffered into memory before the size check runs. Aborts with the
+        # same 413 the declared-length fast path above uses as soon as
+        # accumulated bytes exceed the cap, so an oversized chunked body is
+        # never held in memory in full, regardless of whether a
+        # (dishonest or absent) `Content-Length` header was present.
+        chunks: list[bytes] = []
+        total_bytes = 0
+        async for chunk in request.stream():
+            total_bytes += len(chunk)
+            if total_bytes > MAX_BODY_BYTES:
+                return _error_response(
+                    "request_too_large",
+                    f"request body exceeds the maximum of {MAX_BODY_BYTES} bytes",
+                    status_code=413,
+                )
+            chunks.append(chunk)
+        body_bytes = b"".join(chunks)
 
         try:
             raw = json.loads(body_bytes)

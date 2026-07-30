@@ -277,6 +277,39 @@ async def test_candidates_shape_excludes_an_unknown_name_without_crashing():
     assert response.json()["result"] == "local-won"
 
 
+@pytest.mark.asyncio
+async def test_candidates_shape_naming_only_remote_candidates_resolves_to_no_candidates_response():
+    """[Testing gap 4a] A `candidates` request naming ONLY candidates that
+    are present in the trusted registry but every one of them is
+    `local=False` there must resolve to a structured "no candidates"
+    (422) response -- not a crash, and not a silent success that somehow
+    contacts a remote endpoint. Every named candidate is excluded by the
+    same `local` filter `test_candidates_shape_excludes_a_name_that_is_
+    remote_in_the_trusted_registry` proves for a mixed local/remote list;
+    here NOTHING survives the filter, so the resulting throwaway
+    `ChainsConfig`'s chain has an empty `candidates` list and `execute_chain()`
+    must raise `NoCandidatesError`, which this route already translates to a
+    422 for the `task_type` path -- this proves the SAME translation holds
+    for the `candidates` path when it bottoms out empty."""
+    exploding = ExplodingClient()
+    trusted_registry = {
+        "remote-one": DelegateCandidate(
+            name="remote-one", endpoint="http://attacker-controlled-host/collect", local=False, model="m"
+        ),
+        "remote-two": DelegateCandidate(
+            name="remote-two", endpoint="http://another-remote-host/collect", local=False, model="m"
+        ),
+    }
+    app, _queue = _app_and_queue(registry=trusted_registry, client_factory=lambda c: exploding)
+    async with _client(app) as client:
+        response = await client.post(
+            DELEGATE_INTERNAL_PATH,
+            json={"task": "check", "candidates": ["remote-one", "remote-two"]},
+        )
+    assert response.status_code == 422
+    assert response.json()["error"] == "no_candidates"
+
+
 # --- errors -------------------------------------------------------------------
 
 
@@ -363,6 +396,103 @@ async def test_oversized_body_with_content_length_header_is_rejected_without_rea
 
     assert response.status_code == 413
     assert json.loads(bytes(response.body))["error"] == "request_too_large"
+
+
+@pytest.mark.asyncio
+async def test_chunked_request_with_no_content_length_exceeding_cap_is_rejected_without_buffering():
+    """SECURITY (P1 DoS fix): a request with NO `Content-Length` header at
+    all (the real shape of a chunked-transfer-encoding request, where the
+    sender never declares a total size upfront) must be rejected as soon as
+    the handler has accumulated more than `MAX_BODY_BYTES` -- proven here by
+    a fake ASGI `receive` callable that tracks how many times it's invoked
+    and how many bytes it has handed back, and asserts the handler stopped
+    pulling more chunks (and thus never held the full oversized body in
+    memory) once the cap was exceeded."""
+    route = build_delegate_internal_route(
+        queue=DelegateQueue(),
+        chains_config=ChainsConfig(
+            chains=[DelegationChain(task_type=TASK_TYPE, candidates=["c1"])],
+            allow_remote=True,
+        ),
+        registry={"c1": DelegateCandidate(name="c1", endpoint="http://example.invalid", local=True, model="m")},
+    )
+
+    class ChunkedReceive:
+        """An ASGI `receive` callable simulating a chunked-transfer-encoding
+        body with no declared total size: it hands back one 64KB chunk per
+        call, `more_body=True` every time, and would happily keep going
+        forever if asked -- standing in for an attacker streaming an
+        unbounded body. Tracks every call so the test can assert the
+        handler stopped asking for more well short of actually reading the
+        whole (unbounded) stream."""
+
+        CHUNK_SIZE = 64 * 1024
+
+        def __init__(self) -> None:
+            self.call_count = 0
+            self.bytes_handed_back = 0
+
+        async def __call__(self):
+            self.call_count += 1
+            self.bytes_handed_back += self.CHUNK_SIZE
+            return {
+                "type": "http.request",
+                "body": b"x" * self.CHUNK_SIZE,
+                "more_body": True,
+            }
+
+    receive = ChunkedReceive()
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": DELEGATE_INTERNAL_PATH,
+        # No content-length header at all -- the chunked-transfer shape.
+        "headers": [(b"content-type", b"application/json")],
+    }
+    request = Request(scope, receive=receive)
+
+    response = await route.endpoint(request)
+
+    assert response.status_code == 413
+    assert json.loads(bytes(response.body))["error"] == "request_too_large"
+    # The handler must have stopped well before accumulating anywhere near
+    # the full amount `ChunkedReceive` was willing to hand back -- proving
+    # it aborted incrementally rather than buffering the whole (unbounded)
+    # body first. A generous bound: enough calls to exceed MAX_BODY_BYTES,
+    # never anywhere close to "however many it takes to hang forever".
+    assert receive.bytes_handed_back < MAX_BODY_BYTES + (ChunkedReceive.CHUNK_SIZE * 2)
+    assert receive.call_count < (MAX_BODY_BYTES // ChunkedReceive.CHUNK_SIZE) + 2
+
+
+@pytest.mark.asyncio
+async def test_missing_content_type_is_rejected_with_structured_415():
+    """SECURITY (P1 CSRF-hardening fix): a request with NO `Content-Type`
+    header at all -- the shape a browser's "simple request" (no CORS
+    preflight) can send -- is rejected with 415, not processed as JSON."""
+    app, _queue = _app_and_queue()
+    async with _client(app) as client:
+        response = await client.post(
+            DELEGATE_INTERNAL_PATH,
+            content=json.dumps({"task_type": TASK_TYPE, "task": "x"}).encode("utf-8"),
+        )
+    assert response.status_code == 415
+    assert response.json()["error"] == "unsupported_media_type"
+
+
+@pytest.mark.asyncio
+async def test_non_json_content_type_is_rejected_with_structured_415():
+    """SECURITY: a non-JSON Content-Type (e.g. `text/plain`, another shape
+    a browser's simple-request CSRF path can send without a preflight) is
+    also rejected with 415."""
+    app, _queue = _app_and_queue()
+    async with _client(app) as client:
+        response = await client.post(
+            DELEGATE_INTERNAL_PATH,
+            content=json.dumps({"task_type": TASK_TYPE, "task": "x"}).encode("utf-8"),
+            headers={"Content-Type": "text/plain"},
+        )
+    assert response.status_code == 415
+    assert response.json()["error"] == "unsupported_media_type"
 
 
 @pytest.mark.asyncio
