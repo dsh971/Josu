@@ -1,0 +1,534 @@
+"""Tests for the orchestrator main loop, `josu run` (U13).
+
+Real `git` subprocess calls throughout (via the `git_repo` fixture from
+`tests/orchestrator/conftest.py`), a real `GraphifyEngine` (mirroring
+`tests/graph/test_index.py`'s convention), and a real bound TCP socket for
+the daemon-reachability check -- no mocking of `worktree.py`/`merge.py`/
+`circuit_breaker.py`/`mcp_manifest.py`/`graph/index.py` internals, all of
+which are already independently tested elsewhere.
+
+The one boundary faked here is the adapter invocation itself
+(`adapters.claude_code.run()`'s call shape): `run_task()` accepts an
+`adapter_run` test seam for exactly this reason (see `run.py`'s own
+docstring on why). A hand-written Python callable matching that call shape
+is the appropriate fake-at-the-boundary for THIS module's tests -- the
+adapter's own internal behavior (stream-json parsing, the git allowlist,
+the MCP-server-connected check, ...) is already covered by
+`test_claude_code.py`'s hand-written fake `claude` executable on `PATH`;
+re-mocking or re-faking any of that here would test nothing new. What these
+tests care about is `run_task()`'s OWN composition and sequencing, so
+faking exactly at the "the adapter ran" boundary is what actually isolates
+that.
+"""
+
+from __future__ import annotations
+
+import socket
+import subprocess
+import threading
+from contextlib import closing
+from datetime import date
+from pathlib import Path
+
+import pytest
+
+from josu.config import JosuConfig
+from josu.config.chains import ChainsConfig
+from josu.config.delegate import DelegateConfig
+from josu.config.orchestrator import McpApprovalVerified, OrchestratorConfig
+from josu.graph.build import GraphifyEngine
+from josu.observability.runlog import (
+    RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT,
+    RUN_OUTCOME_DIVERGED,
+    RUN_OUTCOME_MERGED,
+    RUN_OUTCOME_REJECTED,
+    load_run,
+)
+from josu.orchestrator.adapter import InvocationResult
+from josu.orchestrator.adapters.claude_code import (
+    DELEGATE_SERVER_NAME,
+    GRAPH_SERVER_NAME,
+    ClaudeCodeRunResult,
+    ParsedRun,
+    build_default_adapter_config,
+)
+from josu.orchestrator.run import (
+    DaemonNotReachableError,
+    NoUsableAdapterError,
+    run_task,
+)
+from josu.orchestrator.worktree import worktree_diff
+
+
+# --- shared fixtures ----------------------------------------------------------
+
+
+@pytest.fixture
+def git_repo(tmp_path):
+    """A real, minimal git repo -- mirrors `tests/orchestrator/conftest.py`'s
+    own `git_repo` fixture (reused directly here, since this file lives in
+    the same `tests/orchestrator/` package)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "initial commit"], cwd=repo, check=True)
+    return repo
+
+
+@pytest.fixture
+def fake_daemon():
+    """A real, bound (but otherwise-inert) TCP listener standing in for the
+    josu daemon -- `run_task()`'s reachability check just needs SOMETHING
+    to accept a connection and answer an HTTP request; it doesn't need the
+    real MCP/SSE routes to run these tests (those are `test_daemon.py`'s
+    concern). A raw `socket.accept()` loop, closed on fixture teardown."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(5)
+    host, port = server.getsockname()
+
+    stop = threading.Event()
+
+    def _serve():
+        with closing(server):
+            server.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    conn, _ = server.accept()
+                except socket.timeout:
+                    continue
+                with closing(conn):
+                    try:
+                        conn.recv(4096)
+                        conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    except OSError:
+                        pass
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    try:
+        yield host, port
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+
+
+@pytest.fixture
+def engine(tmp_path):
+    return GraphifyEngine(out_dir=tmp_path / "graphify-out")
+
+
+@pytest.fixture
+def adapter_config():
+    attestation = McpApprovalVerified(verified=True, verified_date=date(2026, 1, 1))
+    return build_default_adapter_config(attestation)
+
+
+@pytest.fixture
+def config(adapter_config):
+    return JosuConfig(
+        path=Path("/nonexistent/josu.toml"),
+        delegate=DelegateConfig(),
+        chains=ChainsConfig(),
+        orchestrator=OrchestratorConfig(adapters=[adapter_config]),
+    )
+
+
+def _fake_run_result(worktree, *, result_text: str = "done") -> ClaudeCodeRunResult:
+    return ClaudeCodeRunResult(
+        invocation=InvocationResult(argv=["fake-claude"], returncode=0, stdout="", stderr=""),
+        parsed=ParsedRun(
+            mcp_servers_connected=frozenset({GRAPH_SERVER_NAME, DELEGATE_SERVER_NAME}),
+            bash_commands=[],
+            read_edit_paths=[],
+        ),
+        fields={"result": result_text, "is_error": False},
+        diff=worktree_diff(worktree),
+    )
+
+
+def _make_editing_fake_adapter(write_fn):
+    """A hand-written fake standing in for `adapters.claude_code.run()`:
+    applies `write_fn(worktree)` (the "work Claude Code did") to the
+    worktree, then returns a `ClaudeCodeRunResult`-shaped object. Records
+    every call's kwargs for assertions on what `run_task()` actually passed
+    through."""
+    calls: list[dict] = []
+
+    def _fake_run(adapter, *, worktree, manifest, config_path, task, timeout=None):
+        calls.append(
+            {
+                "adapter": adapter,
+                "worktree": worktree,
+                "manifest": manifest,
+                "config_path": config_path,
+                "task": task,
+                "timeout": timeout,
+            }
+        )
+        write_fn(worktree)
+        return _fake_run_result(worktree)
+
+    return _fake_run, calls
+
+
+# --- happy path: worktree -> adapter -> diff -> approve -> merge -> reindex --
+
+
+def test_full_run_approved_produces_worktree_adapter_diff_merge_and_saved_record(
+    git_repo, tmp_path, fake_daemon, engine, config
+):
+    """Covers the plan's first U13 test scenario: a fixture task against a
+    fixture repo produces a worktree, an adapter invocation, a surfaced
+    diff, and (on approval) a merge, with a saved run-log record covering
+    all of it."""
+    host, port = fake_daemon
+    engine.build(git_repo)
+
+    def _write(worktree):
+        (worktree.path / "README.md").write_text("written by claude code\n", encoding="utf-8")
+
+    fake_run, calls = _make_editing_fake_adapter(_write)
+    seen_diffs: list[str] = []
+
+    def _approve(diff: str) -> bool:
+        seen_diffs.append(diff)
+        return True
+
+    result = run_task(
+        "add a docstring",
+        config=config,
+        repo_root=git_repo,
+        engine=engine,
+        approve=_approve,
+        worktrees_dir=tmp_path / "worktrees",
+        runlog_dir=tmp_path / "runlog",
+        adapter_run=fake_run,
+        host=host,
+        port=port,
+    )
+
+    # The adapter invocation actually happened, against the worktree
+    # run_task itself created.
+    assert len(calls) == 1
+    assert calls[0]["worktree"] == result.worktree
+    assert calls[0]["task"] == "add a docstring"
+
+    # A diff was surfaced for review before the merge decision.
+    assert len(seen_diffs) == 1
+    assert "written by claude code" in seen_diffs[0]
+    assert result.diff == seen_diffs[0]
+
+    # The merge actually happened, into the real repo_root.
+    assert result.outcome == RUN_OUTCOME_MERGED
+    assert result.merge_result is not None
+    assert result.merge_result.merged is True
+    assert (git_repo / "README.md").read_text(encoding="utf-8") == "written by claude code\n"
+
+    # A run-log record was saved covering the whole run.
+    loaded = load_run(result.run_id, tmp_path / "runlog")
+    assert loaded.outcome == RUN_OUTCOME_MERGED
+    assert loaded.worktree_path == str(result.worktree.path)
+    assert loaded.task_description == "add a docstring"
+
+
+# --- developer-rejected diff: no merge, still a saved record ----------------
+
+
+def test_developer_rejected_diff_produces_a_saved_record_with_no_merge(
+    git_repo, tmp_path, fake_daemon, engine, config
+):
+    """Covers the plan's second U13 test scenario: a developer-rejected
+    diff produces a saved record with no merge."""
+    host, port = fake_daemon
+    engine.build(git_repo)
+
+    def _write(worktree):
+        (worktree.path / "README.md").write_text("proposed change\n", encoding="utf-8")
+
+    fake_run, calls = _make_editing_fake_adapter(_write)
+
+    result = run_task(
+        "a task the developer will reject",
+        config=config,
+        repo_root=git_repo,
+        engine=engine,
+        approve=lambda diff: False,
+        worktrees_dir=tmp_path / "worktrees",
+        runlog_dir=tmp_path / "runlog",
+        adapter_run=fake_run,
+        host=host,
+        port=port,
+    )
+
+    assert len(calls) == 1
+    assert result.outcome == RUN_OUTCOME_REJECTED
+    assert result.merge_result is not None
+    assert result.merge_result.merged is False
+    # repo_root's real working tree is untouched.
+    assert (git_repo / "README.md").read_text(encoding="utf-8") == "hello\n"
+
+    loaded = load_run(result.run_id, tmp_path / "runlog")
+    assert loaded.outcome == RUN_OUTCOME_REJECTED
+
+
+# --- circuit-breaker timeout: saved record, worktree left for U8 cleanup ----
+
+
+def test_circuit_breaker_timeout_produces_saved_record_and_leaves_worktree(
+    git_repo, tmp_path, fake_daemon, engine, config
+):
+    """Covers the plan's third U13 test scenario: a circuit-breaker timeout
+    produces a saved record showing the trip, with the worktree left for
+    U8's cleanup rather than silently discarded."""
+    host, port = fake_daemon
+    engine.build(git_repo)
+
+    def _timeout_fake_run(adapter, *, worktree, manifest, config_path, task, timeout=None):
+        # `run_under_circuit_breaker()` catches `subprocess.TimeoutExpired`
+        # raised out of the wrapped call and re-raises it as
+        # `CircuitBreakerTimeoutError` -- this is the real mechanism
+        # (circuit_breaker.py), not re-implemented here.
+        raise subprocess.TimeoutExpired(cmd="fake-claude", timeout=timeout or 0)
+
+    def _approve_should_never_be_called(diff: str) -> bool:
+        raise AssertionError("approve() must not be called after a circuit-breaker trip")
+
+    result = run_task(
+        "a task that will time out",
+        config=config,
+        repo_root=git_repo,
+        engine=engine,
+        approve=_approve_should_never_be_called,
+        worktrees_dir=tmp_path / "worktrees",
+        runlog_dir=tmp_path / "runlog",
+        adapter_run=_timeout_fake_run,
+        host=host,
+        port=port,
+    )
+
+    assert result.outcome == RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT
+    assert result.merge_result is None
+    assert result.worktree is not None
+
+    # The worktree is left in place -- U8's cleanup path handles it, not a
+    # silent discard here.
+    assert result.worktree.path.exists()
+    worktree_list = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert str(result.worktree.path) in worktree_list
+
+    loaded = load_run(result.run_id, tmp_path / "runlog")
+    assert loaded.outcome == RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT
+    assert len(loaded.circuit_breaker_events) == 1
+
+
+# --- successful merge triggers exactly the changed-path reindex (R14) -------
+
+
+def test_successful_merge_triggers_exactly_the_changed_path_reindex(
+    git_repo, tmp_path, fake_daemon, engine, config
+):
+    """Covers the plan's fourth U13 test scenario: a successful merge
+    triggers exactly the changed-path reindex, not a full rebuild."""
+    (git_repo / "unrelated.py").write_text(
+        "def unrelated_function():\n    return 'untouched'\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add unrelated.py"], cwd=git_repo, check=True)
+
+    host, port = fake_daemon
+    engine.build(git_repo)
+    assert engine.search("unrelated_function") != []
+
+    def _write(worktree):
+        (worktree.path / "new_module.py").write_text(
+            "def brand_new_function():\n    pass\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "new_module.py"], cwd=worktree.path, check=True)
+
+    fake_run, _calls = _make_editing_fake_adapter(_write)
+
+    result = run_task(
+        "add a new module",
+        config=config,
+        repo_root=git_repo,
+        engine=engine,
+        approve=lambda diff: True,
+        worktrees_dir=tmp_path / "worktrees",
+        runlog_dir=tmp_path / "runlog",
+        adapter_run=fake_run,
+        host=host,
+        port=port,
+    )
+
+    assert result.outcome == RUN_OUTCOME_MERGED
+    assert result.reindex_result is not None
+    reindexed = [Path(p).name for p in result.reindex_result.reindexed_files]
+    assert reindexed == ["new_module.py"]
+
+    # The new symbol is indexed, and the pre-existing unrelated symbol is
+    # untouched -- not wiped by a full rebuild.
+    assert engine.search("brand_new_function") != []
+    assert engine.search("unrelated_function") != []
+
+    loaded = load_run(result.run_id, tmp_path / "runlog")
+    assert loaded.reindexed_files == result.reindex_result.reindexed_files
+
+
+# --- R21: snapshot timing -- concurrent edit made WHILE the adapter runs ----
+
+
+def test_concurrent_edit_made_while_the_adapter_is_running_is_caught_as_diverged(
+    git_repo, tmp_path, fake_daemon, engine, config
+):
+    """Covers the plan's fifth U13 test scenario, and the whole reason this
+    unit's composition order is load-bearing: a REAL concurrent edit to
+    `repo_root`, made on a separate thread WHILE the (fake) adapter is
+    "running" -- not before it starts -- is still caught as diverged at
+    merge time.
+
+    This proves `snapshot_repo()` was captured BEFORE the adapter ran, not
+    after: if `run_task()` captured the snapshot any later (e.g. after the
+    adapter invocation instead of immediately following worktree creation),
+    this concurrent edit would already be baked into the "before" baseline
+    by the time the snapshot was taken, `find_diverged_paths()` would find
+    no difference, and the merge would silently succeed instead of
+    aborting -- exactly the regression this test guards against.
+
+    Uses real `threading.Event`s (not a `time.sleep` guess) to force actual
+    temporal overlap: the fake adapter blocks until the concurrent editor
+    thread has ACTUALLY written to `repo_root` on disk, so the edit
+    provably lands while the adapter call is still in progress.
+    """
+    host, port = fake_daemon
+    engine.build(git_repo)
+
+    adapter_started = threading.Event()
+    concurrent_edit_done = threading.Event()
+
+    def _fake_run(adapter, *, worktree, manifest, config_path, task, timeout=None):
+        adapter_started.set()
+        # Block until the concurrent edit has actually landed on disk in
+        # repo_root -- proves the edit happens DURING this call, not before
+        # or after it.
+        assert concurrent_edit_done.wait(timeout=5), "concurrent edit never landed"
+        (worktree.path / "README.md").write_text("claude code's version\n", encoding="utf-8")
+        return _fake_run_result(worktree)
+
+    def _concurrent_editor():
+        assert adapter_started.wait(timeout=5), "adapter never started"
+        (git_repo / "README.md").write_text("developer's concurrent edit\n", encoding="utf-8")
+        concurrent_edit_done.set()
+
+    editor_thread = threading.Thread(target=_concurrent_editor)
+    editor_thread.start()
+
+    try:
+        result = run_task(
+            "a task racing a concurrent edit",
+            config=config,
+            repo_root=git_repo,
+            engine=engine,
+            approve=lambda diff: True,
+            worktrees_dir=tmp_path / "worktrees",
+            runlog_dir=tmp_path / "runlog",
+            adapter_run=_fake_run,
+            host=host,
+            port=port,
+        )
+    finally:
+        editor_thread.join(timeout=5)
+
+    assert result.outcome == RUN_OUTCOME_DIVERGED
+    assert result.merge_result is None
+    assert isinstance(result.error, Exception)
+    assert "README.md" in getattr(result.error, "diverged_paths", [])
+
+    # Aborted cleanly: repo_root keeps the developer's own concurrent edit,
+    # never overwritten.
+    assert (
+        git_repo / "README.md"
+    ).read_text(encoding="utf-8") == "developer's concurrent edit\n"
+
+    loaded = load_run(result.run_id, tmp_path / "runlog")
+    assert loaded.outcome == RUN_OUTCOME_DIVERGED
+    assert "README.md" in loaded.diverged_paths
+
+
+# --- no daemon reachable: a clear CLI-usable error, not a stack trace -------
+
+
+def test_no_daemon_reachable_raises_a_clear_actionable_error(git_repo, tmp_path, engine, config):
+    """Covers the plan's sixth U13 test scenario: running with no daemon
+    reachable produces a clear error, not a stack trace -- and is checked
+    early, before any worktree/git work."""
+    # Bind an ephemeral port, then close it immediately -- almost certainly
+    # nothing is listening on it a moment later, giving a real connection
+    # refusal rather than a mocked one.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    _host, unused_port = probe.getsockname()
+    probe.close()
+
+    def _approve_should_never_be_called(diff: str) -> bool:
+        raise AssertionError("approve() must not be called when the daemon is unreachable")
+
+    with pytest.raises(DaemonNotReachableError) as exc_info:
+        run_task(
+            "a task that should never run",
+            config=config,
+            repo_root=git_repo,
+            engine=engine,
+            approve=_approve_should_never_be_called,
+            worktrees_dir=tmp_path / "worktrees",
+            runlog_dir=tmp_path / "runlog",
+            host="127.0.0.1",
+            port=unused_port,
+        )
+
+    assert "start it with" in str(exc_info.value)
+    assert "josu daemon start" in str(exc_info.value)
+
+    # No worktree/git work happened -- checked before any of that, and no
+    # run-log record needed to be saved either.
+    assert not (tmp_path / "worktrees").exists()
+    assert not (tmp_path / "runlog").exists()
+
+
+def test_no_usable_adapter_configured_raises_a_clear_actionable_error(
+    git_repo, tmp_path, fake_daemon, engine
+):
+    """A `josu.toml` with no matching, attested `[[orchestrator.adapters]]`
+    entry also fails clearly, not with a stack trace or an attempt to
+    invoke a nonexistent adapter."""
+    host, port = fake_daemon
+    empty_config = JosuConfig(
+        path=Path("/nonexistent/josu.toml"),
+        delegate=DelegateConfig(),
+        chains=ChainsConfig(),
+        orchestrator=OrchestratorConfig(adapters=[]),
+    )
+
+    with pytest.raises(NoUsableAdapterError):
+        run_task(
+            "a task with nothing configured to run it",
+            config=empty_config,
+            repo_root=git_repo,
+            engine=engine,
+            approve=lambda diff: True,
+            worktrees_dir=tmp_path / "worktrees",
+            runlog_dir=tmp_path / "runlog",
+            host=host,
+            port=port,
+        )

@@ -69,6 +69,17 @@ DELEGATION_OUTCOME_CHAIN_EXHAUSTED = "delegation_exhausted_orchestrator_complete
 # of the sub-task), not the request/response body.
 _MAX_TASK_SUMMARY_CHARS = 500
 
+# U13's overall-run outcomes -- distinguishable strings, mirroring
+# `DELEGATION_OUTCOME_*` above, so `josu run`'s composed orchestrator loop
+# (`orchestrator/run.py`) can record which of the plan's Test scenarios a
+# given run actually landed in without a caller having to infer it from
+# which sub-events happen to be present.
+RUN_OUTCOME_MERGED = "merged"
+RUN_OUTCOME_REJECTED = "rejected"
+RUN_OUTCOME_DIVERGED = "diverged"
+RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT = "circuit_breaker_timeout"
+RUN_OUTCOME_ERROR = "error"
+
 
 def default_runlog_dir(project_root: Path) -> Path:
     """`<project_root>/.josu/runlog/` -- see module docstring for why this
@@ -224,6 +235,21 @@ class RunRecord:
     delegations: list[DelegationEvent] = field(default_factory=list)
     circuit_breaker_events: list[CircuitBreakerEvent] = field(default_factory=list)
 
+    # U13: the composed orchestrator loop's own bookkeeping -- which of the
+    # plan's Test scenarios this run landed in (`RUN_OUTCOME_*` above), plus
+    # enough merge/reindex detail that `josu log` can explain a run "spanning
+    # worktree creation through merge and reindex ... with no code reading
+    # required" (U13 Verification) without a caller having to infer any of
+    # it from which of the events above happen to be present. `outcome` is
+    # `None` only if a run never reached `record_outcome()` at all (an
+    # old-format record predating U13, or an exception raised before
+    # `run_task()`'s own `finally` block runs).
+    outcome: str | None = None
+    worktree_path: str | None = None
+    diverged_paths: list[str] = field(default_factory=list)
+    reindexed_files: list[str] = field(default_factory=list)
+    pruned_files: list[str] = field(default_factory=list)
+
     def record_graph_query(self, operation: str, query: str, result_count: int) -> GraphQueryEvent:
         event = GraphQueryEvent(operation=operation, query=_truncate(query), result_count=result_count)
         self.graph_queries.append(event)
@@ -234,6 +260,26 @@ class RunRecord:
 
     def record_circuit_breaker_event(self, event: CircuitBreakerEvent) -> None:
         self.circuit_breaker_events.append(event)
+
+    def record_outcome(
+        self,
+        outcome: str,
+        *,
+        worktree_path: str | None = None,
+        diverged_paths: Sequence[str] = (),
+        reindexed_files: Sequence[str] = (),
+        pruned_files: Sequence[str] = (),
+    ) -> None:
+        """U13: record the run's overall outcome (one of `RUN_OUTCOME_*`)
+        plus whatever merge/reindex detail is relevant to it. Called exactly
+        once, from `orchestrator/run.py`'s `run_task()` `finally` block, so
+        it always runs regardless of how the run concluded."""
+        self.outcome = outcome
+        if worktree_path is not None:
+            self.worktree_path = worktree_path
+        self.diverged_paths = list(diverged_paths)
+        self.reindexed_files = list(reindexed_files)
+        self.pruned_files = list(pruned_files)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -255,6 +301,11 @@ class RunRecord:
             circuit_breaker_events=[
                 CircuitBreakerEvent(**c) for c in data.get("circuit_breaker_events", [])
             ],
+            outcome=data.get("outcome"),
+            worktree_path=data.get("worktree_path"),
+            diverged_paths=list(data.get("diverged_paths", [])),
+            reindexed_files=list(data.get("reindexed_files", [])),
+            pruned_files=list(data.get("pruned_files", [])),
         )
 
 
@@ -343,6 +394,17 @@ def render_run(record: RunRecord) -> str:
     lines = [f"Run {record.run_id} (started {record.started_at})"]
     if record.task_description:
         lines.append(f"  task: {record.task_description}")
+
+    if record.outcome is not None:
+        lines.append(f"  outcome: {record.outcome}")
+        if record.worktree_path:
+            lines.append(f"    worktree: {record.worktree_path}")
+        if record.diverged_paths:
+            lines.append(f"    diverged paths: {', '.join(record.diverged_paths)}")
+        if record.reindexed_files:
+            lines.append(f"    reindexed: {', '.join(record.reindexed_files)}")
+        if record.pruned_files:
+            lines.append(f"    pruned: {', '.join(record.pruned_files)}")
 
     if not record.graph_queries and not record.delegations and not record.circuit_breaker_events:
         lines.append("  (no graph queries, delegations, or circuit-breaker events recorded)")

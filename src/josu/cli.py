@@ -371,6 +371,94 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prompt_diff_approval(diff: str) -> bool:
+    """The default `approve` callback for `josu run` (U13): print the
+    surfaced diff and prompt for a simple y/n developer decision. Kept as a
+    free function (not inlined in `_cmd_run`) so a test can substitute a
+    canned answer without going through `input()`."""
+    print("----- proposed diff -----")
+    print(diff if diff.strip() else "(no changes)")
+    print("--------------------------")
+    answer = input("Merge this diff into your working tree? [y/N] ").strip().lower()
+    return answer in ("y", "yes")
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    """U13's `josu run <task>`: the end-to-end orchestrator main loop --
+    worktree -> snapshot -> MCP manifest -> circuit-breaker-wrapped adapter
+    invocation -> diff review/merge -> reindex, composed by `orchestrator/
+    run.py`'s `run_task()`. This subcommand is the thin CLI shell around it:
+    resolves config/paths, prints the surfaced diff and prompts for
+    approval, then reports the outcome.
+
+    Requires the daemon already running (the adapter's MCP manifest points
+    at it, same as U14's `_cmd_delegate` above) -- `run_task()` checks this
+    FIRST, before any worktree/git work, so a `DaemonNotReachableError`
+    surfaces here as a clear, actionable message rather than a stack trace.
+    """
+    from josu.config import load_config
+    from josu.graph.build import GraphifyEngine
+    from josu.observability.runlog import (
+        RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT,
+        RUN_OUTCOME_DIVERGED,
+        RUN_OUTCOME_MERGED,
+        RUN_OUTCOME_REJECTED,
+    )
+    from josu.orchestrator.run import DaemonNotReachableError, NoUsableAdapterError, run_task
+
+    repo_root = Path(args.repo_root) if args.repo_root else Path.cwd()
+    config_path = Path(args.config) if args.config else resolve_config_path()
+    config = load_config(config_path)
+
+    graph_out_dir = Path(args.graph_out_dir) if args.graph_out_dir else _default_graph_out_dir()
+    engine = GraphifyEngine(out_dir=graph_out_dir)
+
+    host = args.host or DEFAULT_HOST
+    port = args.port or DEFAULT_PORT
+
+    try:
+        result = run_task(
+            args.task,
+            config=config,
+            repo_root=repo_root,
+            engine=engine,
+            approve=_prompt_diff_approval,
+            adapter_name=args.adapter,
+            host=host,
+            port=port,
+        )
+    except DaemonNotReachableError as exc:
+        print(f"josu run: {exc}")
+        return 1
+    except NoUsableAdapterError as exc:
+        print(f"josu run: {exc}")
+        return 1
+
+    print(f"josu run: run {result.run_id} finished (see `josu log {result.run_id}` for details)")
+
+    if result.outcome == RUN_OUTCOME_MERGED:
+        reindexed = len(result.reindex_result.reindexed_files) if result.reindex_result else 0
+        pruned = len(result.reindex_result.pruned_files) if result.reindex_result else 0
+        print(f"  merged into {repo_root} -- reindexed {reindexed} file(s), pruned {pruned}")
+        return 0
+    if result.outcome == RUN_OUTCOME_REJECTED:
+        print("  diff rejected -- no changes were merged")
+        return 0
+    if result.outcome == RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT:
+        worktree_path = result.worktree.path if result.worktree else "<unknown>"
+        print(
+            f"  circuit breaker tripped: {result.error} -- worktree left at {worktree_path} "
+            "for `josu cleanup` to handle"
+        )
+        return 1
+    if result.outcome == RUN_OUTCOME_DIVERGED:
+        print(f"  merge aborted: {result.error}")
+        return 1
+
+    print(f"  run failed: {result.error}")
+    return 1
+
+
 def _cmd_cleanup(args: argparse.Namespace) -> int:
     """U8's `josu cleanup`: run the crash-recovery scan, list every
     abandoned worktree (U7 quota-exhaustion abandonments and U8 crash
@@ -524,6 +612,52 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"josu daemon port to connect to (default: {DEFAULT_PORT})",
     )
     delegate_parser.set_defaults(func=_cmd_delegate)
+
+    run_parser = subparsers.add_parser(
+        "run",
+        help=(
+            "Run a task end-to-end through the hosted orchestrator loop "
+            "(U13): worktree -> snapshot -> MCP manifest -> circuit-breaker"
+            "-wrapped adapter invocation -> diff review/merge -> reindex. "
+            "Requires the josu daemon already running."
+        ),
+    )
+    run_parser.add_argument("task", help="The task description to hand to the orchestrator adapter")
+    run_parser.add_argument(
+        "--repo-root",
+        default=None,
+        help="Repo root to run the task against (default: cwd)",
+    )
+    run_parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to josu.toml (candidate/chain/orchestrator-adapter config). "
+            "Defaults to the XDG-style location config/__init__.py resolves."
+        ),
+    )
+    run_parser.add_argument(
+        "--graph-out-dir",
+        default=None,
+        help="Where the graph is persisted (default: ./.josu/graphify-out)",
+    )
+    run_parser.add_argument(
+        "--adapter",
+        default="claude_code",
+        help="Which configured orchestrator adapter to run (default: claude_code)",
+    )
+    run_parser.add_argument(
+        "--host",
+        default=None,
+        help=f"josu daemon host the adapter's MCP manifest should point at (default: {DEFAULT_HOST})",
+    )
+    run_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=f"josu daemon port the adapter's MCP manifest should point at (default: {DEFAULT_PORT})",
+    )
+    run_parser.set_defaults(func=_cmd_run)
 
     cleanup_parser = subparsers.add_parser(
         "cleanup",
