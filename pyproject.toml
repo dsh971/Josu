@@ -1,0 +1,31 @@
+[project]
+name = "josu"
+version = "0.1.0"
+description = "Hosted-primary coding agent (Claude Code) that delegates bounded sub-tasks to a local model over MCP, backed by a shared gortex code-relationship graph."
+readme = "README.md"
+authors = [
+    { name = "dsh971" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.0,<2.0",
+    "pydantic>=2.0",
+    "ollama>=0.4",
+    "graphifyy",
+    "uvicorn>=0.30",
+    "psutil>=6.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+josu = "josu.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.12.0"]
+build-backend = "uv_build"
