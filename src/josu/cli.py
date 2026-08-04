@@ -27,10 +27,6 @@ from josu.config import resolve_config_path
 from josu.daemon import DEFAULT_HOST, DEFAULT_PORT
 
 
-def _default_graph_out_dir() -> Path:
-    return Path.cwd() / ".josu" / "graphify-out"
-
-
 # --- U8: crash recovery and cleanup -----------------------------------------
 #
 # `scan_for_crash_orphaned_worktrees()` is the one place that knows about
@@ -218,9 +214,9 @@ def remove_abandoned_worktree(
 
 def _cmd_daemon_start(args: argparse.Namespace) -> int:
     from josu.daemon import run
+    from josu.graph.gortex_process import GortexProcessError
     from josu.orchestrator.worktree import default_worktrees_dir
 
-    graph_out_dir = Path(args.graph_out_dir) if args.graph_out_dir else _default_graph_out_dir()
     target = Path(args.target) if args.target else Path.cwd()
     config_path = Path(args.config) if args.config else resolve_config_path()
 
@@ -239,9 +235,17 @@ def _cmd_daemon_start(args: argparse.Namespace) -> int:
 
     print(
         f"Starting josu daemon on {args.host}:{args.port} "
-        f"(graph: {graph_out_dir}, target: {target}, config: {config_path})"
+        f"(target: {target}, config: {config_path})"
     )
-    run(graph_out_dir, host=args.host, port=args.port, target=target, config_path=config_path)
+    # U15: `run()` spawns (or reuses a validated survivor of) the gortex
+    # subprocess before serving -- a missing `gortex` binary, or one that
+    # crashes during startup, surfaces here as a clean, actionable message
+    # rather than a bare traceback.
+    try:
+        run(host=args.host, port=args.port, target=target, config_path=config_path)
+    except GortexProcessError as exc:
+        print(f"josu daemon start: {exc}")
+        return 1
     return 0
 
 
@@ -332,6 +336,7 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
 
     from josu.config.chains import DELEGABLE_TASK_TYPES
     from josu.daemon import DEFAULT_HOST, DEFAULT_PORT
+    from josu.daemon_auth import resolve_daemon_token
     from josu.delegate.daemon_client import (
         DaemonNotReachableError,
         DelegateInternalError,
@@ -346,11 +351,14 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
     host = args.host or DEFAULT_HOST
     port = args.port or DEFAULT_PORT
     base_url = f"http://{host}:{port}"
+    config_path = Path(args.config) if args.config else resolve_config_path()
 
     try:
         payload = asyncio.run(
             post_delegate_internal(
-                base_url, {"task_type": args.task_type, "task": args.task}
+                base_url,
+                {"task_type": args.task_type, "task": args.task},
+                token=resolve_daemon_token(config_path),
             )
         )
     except DaemonNotReachableError as exc:
@@ -391,17 +399,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
     at it, same as U14's `_cmd_delegate` above). `run_task()` itself also
     checks this first, before any worktree/git work -- but simplify pass:
     this subcommand now ALSO checks reachability here, at the very start,
-    before `load_config()`/`GraphifyEngine(...)` (config load and graph
-    directory creation, both disk I/O with side effects) -- matching the
+    before `load_config()` (disk I/O with side effects) -- matching the
     "fail fast, no side effects" intent `run_task()`'s own docstring already
     documents, but which previously only started applying after this
-    subcommand's own config-load/directory-creation side effects had
-    already happened. Uses the same shared `delegate/daemon_client.py`
-    helper `orchestrator/run.py` uses internally.
+    subcommand's own config-load side effects had already happened. Uses
+    the same shared `delegate/daemon_client.py` helper `orchestrator/run.py`
+    uses internally.
     """
     from josu.config import load_config
     from josu.delegate.daemon_client import DaemonNotReachableError, check_daemon_reachable
-    from josu.graph.build import GraphifyEngine
     from josu.observability.runlog import (
         RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT,
         RUN_OUTCOME_DIVERGED,
@@ -423,15 +429,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     config_path = Path(args.config) if args.config else resolve_config_path()
     config = load_config(config_path)
 
-    graph_out_dir = Path(args.graph_out_dir) if args.graph_out_dir else _default_graph_out_dir()
-    engine = GraphifyEngine(out_dir=graph_out_dir)
-
     try:
         result = run_task(
             args.task,
             config=config,
             repo_root=repo_root,
-            engine=engine,
             approve=_prompt_diff_approval,
             adapter_name=args.adapter,
             host=host,
@@ -544,11 +546,6 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--host", default=DEFAULT_HOST)
     start_parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     start_parser.add_argument(
-        "--graph-out-dir",
-        default=None,
-        help="Where the graph is persisted (default: ./.josu/graphify-out)",
-    )
-    start_parser.add_argument(
         "--target",
         default=None,
         help="Project root to build the graph from if none exists yet (default: cwd)",
@@ -615,9 +612,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Path to josu.toml (candidate/chain config). Defaults to the "
-            "XDG-style location config/__init__.py resolves. Unused directly "
-            "by this command (U14: the daemon, not this CLI process, loads "
-            "config) -- kept for CLI compatibility."
+            "XDG-style location config/__init__.py resolves. The daemon, not "
+            "this CLI process, loads the config itself (U14) -- this flag is "
+            "used here only to resolve the daemon's shared-secret auth token "
+            "file, which lives alongside josu.toml."
         ),
     )
     delegate_parser.add_argument(
@@ -655,11 +653,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Path to josu.toml (candidate/chain/orchestrator-adapter config). "
             "Defaults to the XDG-style location config/__init__.py resolves."
         ),
-    )
-    run_parser.add_argument(
-        "--graph-out-dir",
-        default=None,
-        help="Where the graph is persisted (default: ./.josu/graphify-out)",
     )
     run_parser.add_argument(
         "--adapter",

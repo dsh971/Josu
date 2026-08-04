@@ -24,7 +24,7 @@ from josu.delegate.client import (
     OpenAICompatibleDelegateClient,
 )
 from josu.delegate.local_model import delegate
-from josu.graph.build import GraphifyEngine
+from tests.conftest import FakeGraphEngine
 
 
 @pytest.fixture
@@ -38,10 +38,11 @@ def fixture_repo(tmp_path):
 
 
 @pytest.fixture
-def built_engine(tmp_path, fixture_repo):
-    engine = GraphifyEngine(out_dir=tmp_path / "graphify-out")
-    engine.build(fixture_repo)
-    return engine
+def built_engine():
+    # No search results configured -- exercises the "graph has no match"
+    # fallback-to-file-exploration path (R13), matching this fixture's one
+    # remaining use below.
+    return FakeGraphEngine()
 
 
 class FakeMalformedTwiceClient:
@@ -220,14 +221,33 @@ async def test_delegate_against_real_ollama_as_plain_openai_compatible_candidate
     assert isinstance(outcome.caveats, str)
 
 
-def test_delegate_falls_back_to_file_exploration_when_graph_has_no_match(
+@pytest.mark.asyncio
+async def test_delegate_falls_back_to_file_exploration_when_graph_has_no_match(
     built_engine, fixture_repo
 ):
     from josu.delegate.local_model import _fallback_file_context, _graph_context
 
-    # A query guaranteed not to match anything in the fixture graph.
-    context = _graph_context(built_engine, "zzz_nonexistent_symbol_zzz")
+    # No search results configured on the fake engine -- exercises the
+    # graph-miss fallback path (R13).
+    context = await _graph_context(built_engine, "zzz_nonexistent_symbol_zzz")
     assert context == []
 
     fallback = _fallback_file_context(fixture_repo)
     assert any("helper.py" in path for path in fallback)
+
+
+@pytest.mark.asyncio
+async def test_graph_context_falls_back_when_engine_unreachable():
+    """R13/AE21: an engine-unreachable failure (GortexUnavailableError,
+    a RuntimeError subclass) must fold into the same graph-miss fallback
+    as a genuine no-data result -- not propagate as an unhandled
+    exception."""
+    from josu.delegate.local_model import _graph_context
+    from josu.graph.engine import GraphEngineUnavailableError
+
+    class UnavailableEngine(FakeGraphEngine):
+        async def search(self, query, limit=10):
+            raise GraphEngineUnavailableError("gortex down", reason="unreachable")
+
+    context = await _graph_context(UnavailableEngine(), "anything")
+    assert context == []

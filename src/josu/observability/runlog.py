@@ -34,8 +34,8 @@ No hosted telemetry. Records live under the developer's PROJECT directory
 (`default_runlog_dir()` -> `<project_root>/.josu/runlog/`), not the
 XDG-style, outside-the-tree location `config/__init__.py` uses for
 `josu.toml` -- a run log is project-specific history, unlike global
-developer config, and follows the same `.josu/` convention `cli.py`'s
-`_default_graph_out_dir()` already established for the graph.
+developer config, and follows the same `.josu/` convention
+`orchestrator/worktree.py`'s `DEFAULT_WORKTREES_SUBDIR` already established.
 """
 
 from __future__ import annotations

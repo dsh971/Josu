@@ -56,6 +56,7 @@ for no reason.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,9 +65,9 @@ from typing import Any
 from josu.config import JosuConfig
 from josu.config.orchestrator import OrchestratorAdapterConfig, usable_adapters
 from josu.daemon import DEFAULT_HOST, DEFAULT_PORT
+from josu.daemon_auth import resolve_daemon_token
 from josu.delegate.daemon_client import DaemonNotReachableError, check_daemon_reachable
-from josu.graph.build import GraphifyEngine
-from josu.graph.index import ReindexResult, reindex_on_merge
+from josu.graph.index import ReindexError, ReindexResult, reindex_on_merge
 from josu.observability.runlog import (
     RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT,
     RUN_OUTCOME_DIVERGED,
@@ -169,7 +170,6 @@ def run_task(
     *,
     config: JosuConfig,
     repo_root: Path,
-    engine: GraphifyEngine,
     approve: Callable[[str], bool],
     worktrees_dir: Path | None = None,
     manifests_dir: Path | None = None,
@@ -206,6 +206,7 @@ def run_task(
     any worktree/git work happens, so there's nothing yet to record.
     """
     check_daemon_reachable(host, port)
+    daemon_token = resolve_daemon_token(config.path)
     adapter = _resolve_adapter_config(config, adapter_name)
     run_fn = adapter_run if adapter_run is not None else _ADAPTER_RUN_FUNCTIONS.get(
         adapter_name, _ADAPTER_RUN_FUNCTIONS.get(adapter_name.replace("_", "-"))
@@ -281,7 +282,7 @@ def run_task(
                 # validated -- pure file I/O, no subprocess/timeout
                 # plumbing needed.
                 manifest = write_manifest(
-                    worktree.path, host, port, manifests_dir=manifests_dir
+                    worktree.path, host, port, daemon_token, manifests_dir=manifests_dir
                 )
                 validate_manifest(manifest)
 
@@ -363,8 +364,31 @@ def run_task(
 
         # Step 6: on a successful merge, the changed-path reindex -- derives
         # its own changed-path list from merge_result; nothing passed in
-        # from here (R14).
-        reindex_result = reindex_on_merge(engine, worktree, merge_result)
+        # from here (R14). Routed through the daemon's own live engine
+        # (`graph/internal_api.py`'s internal route), never a
+        # process-local throwaway one -- see `graph/index.py`'s module
+        # docstring for the bug this fixes. `run_task()` itself is sync
+        # (the circuit-breaker/adapter-invocation machinery around it is
+        # blocking, not asyncio-based), so this one async call is bridged
+        # via `asyncio.run()` at this single call site rather than making
+        # the whole function async.
+        try:
+            reindex_result = asyncio.run(
+                reindex_on_merge(
+                    worktree,
+                    merge_result,
+                    base_url=f"http://{host}:{port}",
+                    token=daemon_token,
+                )
+            )
+        except ReindexError as exc:
+            # Computing the changed-path set itself failed (e.g. a bounded
+            # git timeout -- see `graph/index.py`'s `_run_git()`). The
+            # merge already succeeded and is not undone for this -- matches
+            # R13's "graph trouble degrades, doesn't block the caller"
+            # posture applied one level up: a reindex failure must not
+            # turn an already-successful merge into a reported run error.
+            reindex_result = ReindexResult(engine_error=str(exc))
         outcome = RUN_OUTCOME_MERGED
         # Terminal state (merged) -- auto-delete the worktree now, AFTER
         # reindexing (which still needs to read the worktree's working

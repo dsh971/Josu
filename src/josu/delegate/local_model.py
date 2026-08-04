@@ -81,11 +81,11 @@ def _parse_response(content: str) -> tuple[str, str]:
     return str(data["result"]), str(data.get("caveats", ""))
 
 
-def _graph_context(engine: GraphEngine | None, task: str) -> list[dict]:
+async def _graph_context(engine: GraphEngine | None, task: str) -> list[dict]:
     if engine is None:
         return []
     try:
-        return engine.search(task, limit=5)
+        return await engine.search(task, limit=5)
     except RuntimeError:
         return []
 
@@ -148,7 +148,7 @@ async def delegate(
     """
     task, scope = _coerce_task_args(task, scope)
 
-    context = _graph_context(graph_engine, task)
+    context = await _graph_context(graph_engine, task)
     if not context and scope_root is not None:
         context = _fallback_file_context(scope_root)
 

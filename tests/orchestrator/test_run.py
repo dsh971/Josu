@@ -1,11 +1,16 @@
 """Tests for the orchestrator main loop, `josu run` (U13).
 
 Real `git` subprocess calls throughout (via the `git_repo` fixture from
-`tests/orchestrator/conftest.py`), a real `GraphifyEngine` (mirroring
-`tests/graph/test_index.py`'s convention), and a real bound TCP socket for
-the daemon-reachability check -- no mocking of `worktree.py`/`merge.py`/
+`tests/orchestrator/conftest.py`) and a real bound TCP socket for the
+daemon-reachability check -- no mocking of `worktree.py`/`merge.py`/
 `circuit_breaker.py`/`mcp_manifest.py`/`graph/index.py` internals, all of
-which are already independently tested elsewhere.
+which are already independently tested elsewhere. `run_task()` no longer
+takes a graph engine directly (doc-review fix): reindexing is routed
+through the daemon's `/graph/internal/reindex` route
+(`graph/internal_api.py`), so `fake_daemon` below is enough for tests that
+don't care about reindex correctness; the one test that does
+(`test_successful_merge_triggers_exactly_the_changed_path_reindex`) uses a
+real daemon against a fixture gortex HTTP server instead.
 
 The one boundary faked here is the adapter invocation itself
 (`adapters.claude_code.run()`'s call shape): `run_task()` accepts an
@@ -23,6 +28,7 @@ that.
 
 from __future__ import annotations
 
+import asyncio
 import socket
 import subprocess
 import sys
@@ -38,7 +44,6 @@ from josu.config import JosuConfig
 from josu.config.chains import ChainsConfig
 from josu.config.delegate import DelegateConfig
 from josu.config.orchestrator import McpApprovalVerified, OrchestratorConfig
-from josu.graph.build import GraphifyEngine
 from josu.observability.runlog import (
     RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT,
     RUN_OUTCOME_DIVERGED,
@@ -60,6 +65,8 @@ from josu.orchestrator.run import (
     run_task,
 )
 from josu.orchestrator.worktree import worktree_diff
+from tests.conftest import daemon_thread as _daemon_thread
+from tests.conftest import free_port as _free_port
 
 
 # --- shared fixtures ----------------------------------------------------------
@@ -121,20 +128,19 @@ def fake_daemon():
 
 
 @pytest.fixture
-def engine(tmp_path):
-    return GraphifyEngine(out_dir=tmp_path / "graphify-out")
-
-
-@pytest.fixture
 def adapter_config():
     attestation = McpApprovalVerified(verified=True, verified_date=date(2026, 1, 1))
     return build_default_adapter_config(attestation)
 
 
 @pytest.fixture
-def config(adapter_config):
+def config(adapter_config, tmp_path):
+    # A real (if never-written) path under tmp_path, not a literal
+    # nonexistent absolute path -- `run_task()`'s reindex step resolves the
+    # daemon's shared-secret token alongside this path (`daemon_auth.py`),
+    # which needs a creatable parent directory.
     return JosuConfig(
-        path=Path("/nonexistent/josu.toml"),
+        path=tmp_path / "josu.toml",
         delegate=DelegateConfig(),
         chains=ChainsConfig(),
         orchestrator=OrchestratorConfig(adapters=[adapter_config]),
@@ -183,14 +189,13 @@ def _make_editing_fake_adapter(write_fn):
 
 
 def test_full_run_approved_produces_worktree_adapter_diff_merge_and_saved_record(
-    git_repo, tmp_path, fake_daemon, engine, config
+    git_repo, tmp_path, fake_daemon, config
 ):
     """Covers the plan's first U13 test scenario: a fixture task against a
     fixture repo produces a worktree, an adapter invocation, a surfaced
     diff, and (on approval) a merge, with a saved run-log record covering
     all of it."""
     host, port = fake_daemon
-    engine.build(git_repo)
 
     def _write(worktree):
         (worktree.path / "README.md").write_text("written by claude code\n", encoding="utf-8")
@@ -206,7 +211,6 @@ def test_full_run_approved_produces_worktree_adapter_diff_merge_and_saved_record
         "add a docstring",
         config=config,
         repo_root=git_repo,
-        engine=engine,
         approve=_approve,
         worktrees_dir=tmp_path / "worktrees",
         runlog_dir=tmp_path / "runlog",
@@ -257,12 +261,11 @@ def test_full_run_approved_produces_worktree_adapter_diff_merge_and_saved_record
 
 
 def test_developer_rejected_diff_produces_a_saved_record_with_no_merge(
-    git_repo, tmp_path, fake_daemon, engine, config
+    git_repo, tmp_path, fake_daemon, config
 ):
     """Covers the plan's second U13 test scenario: a developer-rejected
     diff produces a saved record with no merge."""
     host, port = fake_daemon
-    engine.build(git_repo)
 
     def _write(worktree):
         (worktree.path / "README.md").write_text("proposed change\n", encoding="utf-8")
@@ -273,7 +276,6 @@ def test_developer_rejected_diff_produces_a_saved_record_with_no_merge(
         "a task the developer will reject",
         config=config,
         repo_root=git_repo,
-        engine=engine,
         approve=lambda diff: False,
         worktrees_dir=tmp_path / "worktrees",
         runlog_dir=tmp_path / "runlog",
@@ -309,13 +311,12 @@ def test_developer_rejected_diff_produces_a_saved_record_with_no_merge(
 
 
 def test_circuit_breaker_timeout_produces_saved_record_and_leaves_worktree(
-    git_repo, tmp_path, fake_daemon, engine, config
+    git_repo, tmp_path, fake_daemon, config
 ):
     """Covers the plan's third U13 test scenario: a circuit-breaker timeout
     produces a saved record showing the trip, with the worktree left for
     U8's cleanup rather than silently discarded."""
     host, port = fake_daemon
-    engine.build(git_repo)
 
     def _timeout_fake_run(adapter, *, worktree, manifest, config_path, task, timeout=None):
         # `run_under_circuit_breaker()` catches `subprocess.TimeoutExpired`
@@ -331,7 +332,6 @@ def test_circuit_breaker_timeout_produces_saved_record_and_leaves_worktree(
         "a task that will time out",
         config=config,
         repo_root=git_repo,
-        engine=engine,
         approve=_approve_should_never_be_called,
         worktrees_dir=tmp_path / "worktrees",
         runlog_dir=tmp_path / "runlog",
@@ -365,7 +365,7 @@ def test_circuit_breaker_timeout_produces_saved_record_and_leaves_worktree(
 
 
 def test_hang_during_worktree_creation_is_caught_by_the_circuit_breaker(
-    git_repo, tmp_path, fake_daemon, engine, adapter_config, monkeypatch
+    git_repo, tmp_path, fake_daemon, adapter_config, monkeypatch
 ):
     """P3 fix (U13/U14 Tier 2 review): previously, worktree creation/the R21
     snapshot/MCP manifest generation (steps 1-3) ran with NO timeout
@@ -385,7 +385,6 @@ def test_hang_during_worktree_creation_is_caught_by_the_circuit_breaker(
     `worktree.py`'s own `_run_git()` would produce now that `timeout` is
     threaded through it."""
     host, port = fake_daemon
-    engine.build(git_repo)
 
     def _hanging_create_worktree(
         repo_root, worktrees_dir, *, name=None, task_description=None, timeout=None
@@ -409,7 +408,7 @@ def test_hang_during_worktree_creation_is_caught_by_the_circuit_breaker(
         raise AssertionError("approve() must not be called after a circuit-breaker trip")
 
     tiny_timeout_config = JosuConfig(
-        path=Path("/nonexistent/josu.toml"),
+        path=tmp_path / "josu.toml",
         delegate=DelegateConfig(),
         chains=ChainsConfig(),
         orchestrator=OrchestratorConfig(adapters=[adapter_config]),
@@ -421,7 +420,6 @@ def test_hang_during_worktree_creation_is_caught_by_the_circuit_breaker(
         "a task whose worktree creation hangs",
         config=tiny_timeout_config,
         repo_root=git_repo,
-        engine=engine,
         approve=_approve_should_never_be_called,
         worktrees_dir=tmp_path / "worktrees",
         runlog_dir=tmp_path / "runlog",
@@ -451,19 +449,55 @@ def test_hang_during_worktree_creation_is_caught_by_the_circuit_breaker(
 
 
 def test_successful_merge_triggers_exactly_the_changed_path_reindex(
-    git_repo, tmp_path, fake_daemon, engine, config
+    git_repo, tmp_path, config
 ):
     """Covers the plan's fourth U13 test scenario: a successful merge
-    triggers exactly the changed-path reindex, not a full rebuild."""
+    triggers exactly the changed-path reindex, not a full rebuild.
+
+    Uses a real running daemon (against a fixture gortex HTTP server, not
+    `fake_daemon`'s inert TCP listener) so the assertion can inspect what
+    `/graph/internal/reindex` actually received -- proving the reindex call
+    reaches the daemon's live engine with exactly the changed-file list,
+    not a full-tree rescan or a throwaway engine nothing else can see."""
+    import json as json_module
+
+    from josu.daemon import create_app
+    from josu.graph.gortex_process import GortexProcess
+
     (git_repo / "unrelated.py").write_text(
         "def unrelated_function():\n    return 'untouched'\n", encoding="utf-8"
     )
     subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "add unrelated.py"], cwd=git_repo, check=True)
 
-    host, port = fake_daemon
-    engine.build(git_repo)
-    assert engine.search("unrelated_function") != []
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    received_reindex_calls: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json_module.loads(self.rfile.read(length)) if length else {}
+            if self.path == "/v1/tools/reindex_repository":
+                received_reindex_calls.append(body)
+            payload = json_module.dumps({"status": "ok"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+            pass
+
+    gortex_httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    gortex_thread = threading.Thread(target=gortex_httpd.serve_forever, daemon=True)
+    gortex_thread.start()
+    fake_gortex_process = GortexProcess(
+        host="127.0.0.1", port=gortex_httpd.server_port, popen=None
+    )
+
+    app = create_app(target=git_repo, config=config, gortex_process=fake_gortex_process)
 
     def _write(worktree):
         (worktree.path / "new_module.py").write_text(
@@ -473,28 +507,35 @@ def test_successful_merge_triggers_exactly_the_changed_path_reindex(
 
     fake_run, _calls = _make_editing_fake_adapter(_write)
 
-    result = run_task(
-        "add a new module",
-        config=config,
-        repo_root=git_repo,
-        engine=engine,
-        approve=lambda diff: True,
-        worktrees_dir=tmp_path / "worktrees",
-        runlog_dir=tmp_path / "runlog",
-        adapter_run=fake_run,
-        host=host,
-        port=port,
-    )
+    daemon_port = _free_port()
+    try:
+        with _daemon_thread(app, "127.0.0.1", daemon_port):
+            result = run_task(
+                "add a new module",
+                config=config,
+                repo_root=git_repo,
+                approve=lambda diff: True,
+                worktrees_dir=tmp_path / "worktrees",
+                runlog_dir=tmp_path / "runlog",
+                adapter_run=fake_run,
+                host="127.0.0.1",
+                port=daemon_port,
+            )
+    finally:
+        gortex_httpd.shutdown()
+        gortex_thread.join()
 
     assert result.outcome == RUN_OUTCOME_MERGED
     assert result.reindex_result is not None
     reindexed = [Path(p).name for p in result.reindex_result.reindexed_files]
     assert reindexed == ["new_module.py"]
+    assert result.reindex_result.engine_error is None
 
-    # The new symbol is indexed, and the pre-existing unrelated symbol is
-    # untouched -- not wiped by a full rebuild.
-    assert engine.search("brand_new_function") != []
-    assert engine.search("unrelated_function") != []
+    # The daemon's live engine received exactly the changed-path reindex --
+    # not unrelated.py, not README.md, not a full rebuild.
+    assert len(received_reindex_calls) == 1
+    reindexed_paths = [Path(p).name for p in received_reindex_calls[0]["paths"]]
+    assert reindexed_paths == ["new_module.py"]
 
     loaded = load_run(result.run_id, tmp_path / "runlog")
     assert loaded.reindexed_files == result.reindex_result.reindexed_files
@@ -504,7 +545,7 @@ def test_successful_merge_triggers_exactly_the_changed_path_reindex(
 
 
 def test_concurrent_edit_made_while_the_adapter_is_running_is_caught_as_diverged(
-    git_repo, tmp_path, fake_daemon, engine, config
+    git_repo, tmp_path, fake_daemon, config
 ):
     """Covers the plan's fifth U13 test scenario, and the whole reason this
     unit's composition order is load-bearing: a REAL concurrent edit to
@@ -526,7 +567,6 @@ def test_concurrent_edit_made_while_the_adapter_is_running_is_caught_as_diverged
     provably lands while the adapter call is still in progress.
     """
     host, port = fake_daemon
-    engine.build(git_repo)
 
     adapter_started = threading.Event()
     concurrent_edit_done = threading.Event()
@@ -553,7 +593,6 @@ def test_concurrent_edit_made_while_the_adapter_is_running_is_caught_as_diverged
             "a task racing a concurrent edit",
             config=config,
             repo_root=git_repo,
-            engine=engine,
             approve=lambda diff: True,
             worktrees_dir=tmp_path / "worktrees",
             runlog_dir=tmp_path / "runlog",
@@ -583,7 +622,7 @@ def test_concurrent_edit_made_while_the_adapter_is_running_is_caught_as_diverged
 # --- no daemon reachable: a clear CLI-usable error, not a stack trace -------
 
 
-def test_no_daemon_reachable_raises_a_clear_actionable_error(git_repo, tmp_path, engine, config):
+def test_no_daemon_reachable_raises_a_clear_actionable_error(git_repo, tmp_path, config):
     """Covers the plan's sixth U13 test scenario: running with no daemon
     reachable produces a clear error, not a stack trace -- and is checked
     early, before any worktree/git work."""
@@ -603,7 +642,6 @@ def test_no_daemon_reachable_raises_a_clear_actionable_error(git_repo, tmp_path,
             "a task that should never run",
             config=config,
             repo_root=git_repo,
-            engine=engine,
             approve=_approve_should_never_be_called,
             worktrees_dir=tmp_path / "worktrees",
             runlog_dir=tmp_path / "runlog",
@@ -621,14 +659,14 @@ def test_no_daemon_reachable_raises_a_clear_actionable_error(git_repo, tmp_path,
 
 
 def test_no_usable_adapter_configured_raises_a_clear_actionable_error(
-    git_repo, tmp_path, fake_daemon, engine
+    git_repo, tmp_path, fake_daemon
 ):
     """A `josu.toml` with no matching, attested `[[orchestrator.adapters]]`
     entry also fails clearly, not with a stack trace or an attempt to
     invoke a nonexistent adapter."""
     host, port = fake_daemon
     empty_config = JosuConfig(
-        path=Path("/nonexistent/josu.toml"),
+        path=tmp_path / "josu.toml",
         delegate=DelegateConfig(),
         chains=ChainsConfig(),
         orchestrator=OrchestratorConfig(adapters=[]),
@@ -639,7 +677,6 @@ def test_no_usable_adapter_configured_raises_a_clear_actionable_error(
             "a task with nothing configured to run it",
             config=empty_config,
             repo_root=git_repo,
-            engine=engine,
             approve=lambda diff: True,
             worktrees_dir=tmp_path / "worktrees",
             runlog_dir=tmp_path / "runlog",
@@ -652,7 +689,7 @@ def test_no_usable_adapter_configured_raises_a_clear_actionable_error(
 
 
 def test_unexpected_exception_from_the_adapter_saves_an_error_record_with_diagnostic_detail(
-    git_repo, tmp_path, fake_daemon, engine, config
+    git_repo, tmp_path, fake_daemon, config
 ):
     """P1 fix: `RUN_OUTCOME_ERROR` previously saved with no diagnostic
     detail at all. An adapter raising something unexpected (not
@@ -662,7 +699,6 @@ def test_unexpected_exception_from_the_adapter_saves_an_error_record_with_diagno
     saved `RunRecord` now carries `error_class`/`error_message` describing
     exactly what went wrong, not just a bare `outcome: error`."""
     host, port = fake_daemon
-    engine.build(git_repo)
 
     def _exploding_adapter(adapter, *, worktree, manifest, config_path, task, timeout=None):
         raise RuntimeError("simulated daemon crash mid-run")
@@ -672,7 +708,6 @@ def test_unexpected_exception_from_the_adapter_saves_an_error_record_with_diagno
             "a task whose adapter blows up unexpectedly",
             config=config,
             repo_root=git_repo,
-            engine=engine,
             approve=lambda diff: True,
             worktrees_dir=tmp_path / "worktrees",
             runlog_dir=tmp_path / "runlog",

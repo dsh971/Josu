@@ -1,7 +1,7 @@
 [project]
 name = "josu"
 version = "0.1.0"
-description = "Hosted-primary coding agent (Claude Code) that delegates bounded sub-tasks to a local model over MCP, backed by a shared graphify context graph."
+description = "Hosted-primary coding agent (Claude Code) that delegates bounded sub-tasks to a local model over MCP, backed by a shared gortex code-relationship graph."
 readme = "README.md"
 authors = [
     { name = "dsh971" }

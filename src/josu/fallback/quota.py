@@ -51,8 +51,8 @@ Two independent things happen when quota exhaustion is detected:
   (U8, not built as of this unit) to hook into, so this writes a small JSON
   marker file per abandoned worktree under `<repo_root>/.josu/abandoned-
   worktrees/<worktree-name>.json` -- the same project-local `.josu/`
-  convention `observability/runlog.py` and `cli.py`'s
-  `_default_graph_out_dir()` already use, and a directory U8's future
+  convention `observability/runlog.py` and `orchestrator/worktree.py`'s
+  `DEFAULT_WORKTREES_SUBDIR` already use, and a directory U8's future
   `josu cleanup` command can simply list to discover every abandoned
   worktree, without this module needing to know anything about how that
   command will eventually be built.

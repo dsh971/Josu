@@ -22,7 +22,7 @@ from josu.config.chains import ChainsConfig, DelegationChain
 from josu.config.delegate import DelegateCandidate
 from josu.delegate.client import DelegateRateLimitedError, DelegateUnreachableError
 from josu.delegate.server import build_server
-from josu.graph.build import GraphifyEngine
+from tests.conftest import FakeGraphEngine
 
 TASK_TYPE = "file_summarization"
 
@@ -38,10 +38,8 @@ def fixture_repo(tmp_path):
 
 
 @pytest.fixture
-def built_engine(tmp_path, fixture_repo):
-    engine = GraphifyEngine(out_dir=tmp_path / "graphify-out")
-    engine.build(fixture_repo)
-    return engine
+def built_engine():
+    return FakeGraphEngine()
 
 
 def _single_candidate_chain(

@@ -432,12 +432,14 @@ def test_commit_hook_http_timeout_fires_against_a_wedged_daemon_and_degrades_gra
     small value purely so this test doesn't have to wait out the real 20s
     to prove the plumbing works; the mechanism actually exercised is real
     end to end: a real socket, real `httpx` read-timeout enforcement inside
-    `post_delegate_internal()`, its `except httpx.TransportError`
-    translating that into `DaemonNotReachableError` (a timeout IS a
-    `TransportError` in httpx's own exception hierarchy), and
-    `_run_commit_hook_from_cli()`'s `except DaemonNotReachableError`
-    handling it by printing a message and returning a non-zero exit code --
-    never hanging, never an uncaught exception."""
+    `post_delegate_internal()`. `daemon_client.py`'s `post_json_to_internal_
+    route()` catches `httpx.TimeoutException` specifically (reliability-
+    review fix) and raises `DelegateInternalError("request_timeout", ...)`
+    rather than `DaemonNotReachableError` -- a client-side give-up isn't
+    proof the daemon is actually down, just that this call didn't hear back
+    in time -- and `_run_commit_hook_from_cli()`'s `except
+    DelegateInternalError` handles it by printing a message and returning a
+    non-zero exit code -- never hanging, never an uncaught exception."""
     host, port = wedged_daemon
 
     config_home = tmp_path / "config-home"

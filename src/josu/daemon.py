@@ -1,24 +1,32 @@
-"""Long-running process hosting the context-graph MCP server (and, once
-built, the local-delegate MCP server) over local HTTP/SSE.
+"""Long-running process hosting the context-graph and delegate MCP servers
+over local HTTP/SSE, plus the gortex subprocess the graph server depends on.
 
 Not stdio: stdio transport spawns a fresh server process per Claude Code
 session, which would give every worktree its own graph-engine instance and
-(once the delegate server is mounted here too) its own delegate queue --
-defeating the reason a single shared daemon exists. Every per-worktree
---mcp-config manifest and every direct-call path (quota fallback, proactive
-checks) points at this same running instance. See plan Key Technical
-Decisions.
+its own delegate queue -- defeating the reason a single shared daemon
+exists. Every per-worktree --mcp-config manifest and every direct-call path
+(quota fallback, proactive checks) points at this same running instance.
+See plan Key Technical Decisions.
 
-U12: startup loads `josu.toml` (via `config/__init__.py`, which composes
-U11's candidate registry and U3's fallback-chain schema) and passes the
-resolved config into the delegate server's construction, replacing the
-single hardcoded `delegate_model` string U1/U2 shipped with -- the daemon
-no longer knows about "a model", only about the candidate/chain config a
-developer has authored.
+U15: this daemon also owns the gortex subprocess's lifecycle -- spawning it
+(or reusing a validated survivor from a prior crash) before constructing
+`GortexEngine`, and terminating it on a clean shutdown. Startup blocks on
+gortex's `/healthz` liveness probe only, never on gortex's own initial
+index completing (see `graph/gortex_process.py`'s and the plan's Key
+Technical Decisions) -- there is deliberately no `engine.build()` call at
+startup at all: gortex indexes the path it was spawned with (`--index
+<root>`) as part of starting up, so nothing here needs to separately kick
+off a build the way the graphify-era `GraphifyEngine.build()` precondition
+did.
+
+Every route (graph/delegate SSE, both internal POST endpoints) requires the
+daemon's shared-secret token (`daemon_auth.py`) -- loopback binding alone
+authenticates nothing.
 """
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
@@ -28,95 +36,137 @@ from starlette.responses import Response
 from starlette.routing import Mount, Route
 
 from josu.config import JosuConfig, load_config
+from josu.daemon_auth import (
+    DaemonAuthMiddleware,
+    load_or_create_daemon_token,
+    resolve_daemon_token_path,
+)
 from josu.delegate.internal_api import build_delegate_internal_route
 from josu.delegate.local_model import DEFAULT_TIMEOUT_SECONDS
 from josu.delegate.queue import DelegateQueue
 from josu.delegate.server import build_server as build_delegate_server
-from josu.graph.build import GraphifyEngine
+from josu.graph.gortex import GortexEngine
+from josu.graph.gortex_process import (
+    DEFAULT_GORTEX_HOST,
+    DEFAULT_GORTEX_PORT,
+    GortexProcess,
+    check_gortex_reachable,
+    spawn_gortex,
+    terminate_gortex,
+)
+from josu.graph.internal_api import build_graph_internal_route
 from josu.graph.server import build_server as build_graph_server
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
 
+def _ensure_gortex_running(
+    target: Path, *, gortex_host: str, gortex_port: int
+) -> GortexProcess:
+    """Probe the expected gortex port first -- a validated survivor from a
+    prior crash is reused (mirrors `cli.py`'s `scan_for_crash_orphaned_
+    worktrees()` "surface, don't silently resume" precedent); otherwise a
+    fresh subprocess is spawned. Never blindly spawns a second instance on
+    top of one already there."""
+    if check_gortex_reachable(gortex_host, gortex_port):
+        return GortexProcess(host=gortex_host, port=gortex_port, popen=None)
+    return spawn_gortex(target, host=gortex_host, port=gortex_port)
+
+
 def create_app(
-    graph_out_dir: Path,
     target: Path | None = None,
     config: JosuConfig | None = None,
     config_path: Path | None = None,
     delegate_timeout: float = DEFAULT_TIMEOUT_SECONDS,
     delegate_client_factory=None,
+    gortex_host: str = DEFAULT_GORTEX_HOST,
+    gortex_port: int = DEFAULT_GORTEX_PORT,
+    gortex_process: GortexProcess | None = None,
 ) -> Starlette:
-    """Build the Starlette ASGI app mounting both MCP servers over SSE.
+    """Build the Starlette ASGI app mounting both MCP servers over SSE, the
+    two internal POST routes, and the auth middleware guarding all of them.
 
-    If no graph has been built yet at `graph_out_dir`, builds one over
-    `target` (defaulting to the current directory) before serving --
-    otherwise the daemon would come up with nothing to answer queries with.
+    `gortex_process` (test seam): when given, skips the real
+    probe-then-spawn sequence entirely and uses this handle directly --
+    lets a test construct a daemon against a stub gortex HTTP server
+    without a real `gortex` binary on `PATH`. `None` (the default)
+    preserves real production behavior (`_ensure_gortex_running()`).
 
     `config` is the already-loaded `josu.toml` contents; if omitted, it's
-    loaded here via `config/__init__.py.load_config(config_path)`
-    (`config_path=None` resolves the XDG-style default location). Passing
-    `config` directly lets tests construct a fixture config without writing
-    a real file to disk when they don't need to also exercise path
-    resolution/permission checks.
+    loaded here via `config/__init__.py.load_config(config_path)`.
 
     The delegate server shares this same process and holds the one graph
     engine instance, so its queue (U2) is genuinely process-wide rather than
     per-worktree, and it queries the same graph the orchestrator does (R8).
 
     U14: exactly ONE `DelegateQueue` is constructed here and shared between
-    `build_delegate_server()` (the MCP tool, `delegate_to_local`) and
-    `build_delegate_internal_route()` (the new internal HTTP endpoint used
-    by `josu delegate` and the commit hook) -- previously `build_server()`
-    constructed its own queue internally with no way for a second caller to
-    reach it, which meant "the daemon owns the one canonical queue" wasn't
-    actually true. Both entry points now serialize through this single
-    instance's lock.
+    `build_delegate_server()` (the MCP tool) and
+    `build_delegate_internal_route()` (the internal delegate HTTP route).
 
-    `delegate_client_factory` (U14 test seam): threaded into both the MCP
-    tool and the internal route, mirroring `build_delegate_server()`'s own
-    existing `client_factory` parameter -- lets tests inject a fake
-    `DelegateClient` (e.g. to prove a candidate is never contacted) for a
-    daemon started through this same production entry point, without
-    reaching over the network. `None` (the default) preserves existing
-    production behavior unchanged.
+    U15: the daemon's shared-secret auth token (`daemon_auth.py`) is
+    loaded/created alongside `josu.toml`'s own XDG-style config directory
+    and required on every route below via `DaemonAuthMiddleware`.
     """
     if config is None:
         config = load_config(config_path)
 
-    engine = GraphifyEngine(out_dir=graph_out_dir)
-    if not engine.graph_path.exists():
-        engine.build(target or Path.cwd())
-    graph_server = build_graph_server(engine)
-    graph_sse = SseServerTransport("/graph/messages/")
+    # Resolve the token path from `config.path` itself, not the separate
+    # `config_path` parameter -- a caller passing a pre-built `config`
+    # object directly (as this function's own docstring says is supported,
+    # for tests) would otherwise silently fall back to the XDG default
+    # token location even though `config.path` points elsewhere, causing
+    # every authenticated request to fail with a token mismatch nothing
+    # would explain. `config.path` is always the true resolved path
+    # regardless of which parameter produced `config`.
+    token_path = resolve_daemon_token_path(config.path.parent)
+    token = load_or_create_daemon_token(token_path)
 
-    registry = {candidate.name: candidate for candidate in config.delegate.candidates}
-    delegate_queue = DelegateQueue()
-    delegate_server = build_delegate_server(
-        graph_engine=engine,
-        chains_config=config.chains,
-        registry=registry,
-        timeout=delegate_timeout,
-        queue=delegate_queue,
-        client_factory=delegate_client_factory,
+    # Captured before `gortex_process` is shadowed by `resolved_gortex_
+    # process` below -- a caller-supplied `gortex_process` (the test seam)
+    # is never this daemon instance's to terminate, since it didn't spawn
+    # it. Both the construction-failure `except` below and `lifespan`'s
+    # clean-shutdown teardown gate `terminate_gortex()` on this same flag.
+    owns_gortex_process = gortex_process is None
+    resolved_gortex_process = gortex_process or _ensure_gortex_running(
+        target or Path.cwd(), gortex_host=gortex_host, gortex_port=gortex_port
     )
-    delegate_sse = SseServerTransport("/delegate/messages/")
+    # Everything below can raise (a malformed josu.toml surfacing during
+    # chain/registry construction, etc.) -- if it does, `resolved_gortex_
+    # process` was already spawned above but `lifespan`'s teardown never
+    # gets a chance to run (the app is never constructed/served), which
+    # would otherwise leak the child process indefinitely.
+    try:
+        engine = GortexEngine(resolved_gortex_process.base_url)
 
-    # U14: the internal route shares `delegate_queue`, `config.chains`, and
-    # `registry` with the MCP tool above -- see this module's and
-    # `delegate/internal_api.py`'s docstrings for the queue-sharing
-    # rationale and the deliberate loopback-TCP-vs-UDS trust-boundary
-    # decision (mounted into this same app/port, not a separate UDS
-    # listener, given `run()`'s current single-blocking-`uvicorn.run()`
-    # structure).
-    internal_delegate_route = build_delegate_internal_route(
-        queue=delegate_queue,
-        chains_config=config.chains,
-        registry=registry,
-        graph_engine=engine,
-        timeout=delegate_timeout,
-        client_factory=delegate_client_factory,
-    )
+        graph_server = build_graph_server(engine)
+        graph_sse = SseServerTransport("/graph/messages/")
+
+        registry = {candidate.name: candidate for candidate in config.delegate.candidates}
+        delegate_queue = DelegateQueue()
+        delegate_server = build_delegate_server(
+            graph_engine=engine,
+            chains_config=config.chains,
+            registry=registry,
+            timeout=delegate_timeout,
+            queue=delegate_queue,
+            client_factory=delegate_client_factory,
+        )
+        delegate_sse = SseServerTransport("/delegate/messages/")
+
+        internal_delegate_route = build_delegate_internal_route(
+            queue=delegate_queue,
+            chains_config=config.chains,
+            registry=registry,
+            graph_engine=engine,
+            timeout=delegate_timeout,
+            client_factory=delegate_client_factory,
+        )
+        internal_graph_route = build_graph_internal_route(engine=engine)
+    except Exception:
+        if owns_gortex_process:
+            terminate_gortex(resolved_gortex_process)
+        raise
 
     async def handle_graph_sse(request):
         async with graph_sse.connect_sse(
@@ -142,12 +192,26 @@ def create_app(
         Route("/delegate/sse", endpoint=handle_delegate_sse, methods=["GET"]),
         Mount("/delegate/messages/", app=delegate_sse.handle_post_message),
         internal_delegate_route,
+        internal_graph_route,
     ]
-    return Starlette(routes=routes)
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette):
+        yield
+        # Clean-shutdown teardown, gated on `owns_gortex_process` (see
+        # above). uvicorn translates SIGINT/SIGTERM into this ASGI lifespan
+        # "shutdown" event; a non-clean exit (`kill -9`, OOM) does not, and
+        # the orphaned gortex process is left for the next `daemon start`'s
+        # reuse/conflict probe -- deliberate, see `gortex_process.py`'s
+        # module docstring.
+        if owns_gortex_process:
+            terminate_gortex(resolved_gortex_process)
+
+    app = Starlette(routes=routes, lifespan=lifespan)
+    return DaemonAuthMiddleware(app, token)
 
 
 def run(
-    graph_out_dir: Path,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     target: Path | None = None,
@@ -156,7 +220,6 @@ def run(
     delegate_timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> None:
     app = create_app(
-        graph_out_dir,
         target=target,
         config=config,
         config_path=config_path,

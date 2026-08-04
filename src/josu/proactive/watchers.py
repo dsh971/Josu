@@ -589,11 +589,58 @@ _COMMIT_HOOK_TASK_TEXT = "Re-evaluate the repository for issues introduced by th
 _COMMIT_HOOK_HTTP_TIMEOUT_SECONDS = 20.0
 
 
+def _run_reindex_on_commit(base_url: str, token: str) -> None:
+    """U10/R14 wiring (doc-review fix): the commit hook is the one
+    production entry point `graph/index.py`'s `reindex_on_commit()`
+    previously had zero callers for. Best-effort -- a reindex failure here
+    must never fail the developer's `git commit` (it already degrades
+    gracefully via `ReindexResult.engine_error`, see `graph/index.py`), and
+    is reported, not raised. Uses the same trimmed
+    `_COMMIT_HOOK_HTTP_TIMEOUT_SECONDS` budget the delegate call below
+    already does -- a wedged daemon must not block `git commit` for the
+    general-purpose 120s default either call would otherwise wait out.
+
+    Note: `reindex_on_save()`'s own production wiring is a separate,
+    pre-existing gap this fix does not close -- no editor-plugin/file-watcher
+    save-event source exists anywhere in this codebase yet to call it from
+    (see `DebouncedSaveWatcher`'s own docstring); there's no call site here
+    to add.
+    """
+    import asyncio
+
+    from josu.graph.index import ReindexError, reindex_on_commit
+
+    try:
+        result = asyncio.run(
+            reindex_on_commit(
+                Path.cwd(),
+                base_url=base_url,
+                token=token,
+                timeout=_COMMIT_HOOK_HTTP_TIMEOUT_SECONDS,
+            )
+        )
+    except ReindexError as exc:
+        # Computing the changed-file set itself failed (e.g. a git error) --
+        # must never fail the developer's `git commit` over this any more
+        # than an engine-unavailable failure would (see `ReindexResult.
+        # engine_error`'s handling below).
+        print(f"josu proactive check: reindex skipped ({exc})")
+        return
+    if result.engine_error:
+        print(f"josu proactive check: reindex skipped ({result.engine_error})")
+    elif result.reindexed_files or result.pruned_files:
+        print(
+            f"josu proactive check: reindexed {len(result.reindexed_files)} file(s), "
+            f"pruned {len(result.pruned_files)}"
+        )
+
+
 def _run_commit_hook_from_cli() -> int:
     import asyncio
 
     from josu.config import load_config, resolve_config_path
     from josu.daemon import DEFAULT_HOST, DEFAULT_PORT
+    from josu.daemon_auth import resolve_daemon_token
     from josu.delegate.daemon_client import (
         DaemonNotReachableError,
         DelegateInternalError,
@@ -603,6 +650,10 @@ def _run_commit_hook_from_cli() -> int:
     config_path = resolve_config_path()
     config = load_config(config_path)
     registry = {candidate.name: candidate for candidate in config.delegate.candidates}
+    base_url = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
+    token = resolve_daemon_token(config_path)
+
+    _run_reindex_on_commit(base_url, token)
 
     # R39: resolve the local-only projection HERE, client-side, before ever
     # contacting the daemon -- see the module docstring and this section's
@@ -615,7 +666,6 @@ def _run_commit_hook_from_cli() -> int:
         return 0
 
     candidates = list(local_registry.values())
-    base_url = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
 
     try:
         payload = asyncio.run(
@@ -631,6 +681,7 @@ def _run_commit_hook_from_cli() -> int:
                     "candidates": [candidate.name for candidate in candidates],
                 },
                 timeout=_COMMIT_HOOK_HTTP_TIMEOUT_SECONDS,
+                token=token,
             )
         )
     except DaemonNotReachableError as exc:

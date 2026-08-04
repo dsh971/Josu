@@ -21,14 +21,18 @@ _SEARCH_DESCRIPTION = (
     "Fuzzy/substring search over the codebase's context graph. Returns matching "
     "nodes (functions, classes, files) plus their immediate neighbors for context. "
     "Use this to find where something is defined or referenced before reading files "
-    "directly."
+    "directly. Results reflect the primary repo's last indexed commit, not this "
+    "task's own in-progress edits -- treat a miss as inconclusive, not certain."
 )
 
 _EXECUTE_DESCRIPTION = (
-    "Run a specific graph query. `operation` must be one of: 'get_node' (params: "
-    "node_id), 'get_neighbors' (params: node_id), 'shortest_path' (params: source, "
-    "target), 'graph_stats' (no params). Prefer `search` for open-ended exploration; "
-    "use `execute` when you already know the specific node or relationship you need."
+    "Run a specific graph operation by name (e.g. relationship/impact queries -- "
+    "'who calls this', 'what breaks if I change this', dependency/dataflow analysis -- "
+    "consult the graph engine's own tool catalogue for the full operation list). "
+    "Prefer `search` for open-ended exploration; use `execute` when you already know "
+    "the specific operation you need. If a delegation call returns an error "
+    "indicating the graph is unreachable or has no data for this query, fall back to "
+    "reading files directly rather than retrying the same operation."
 )
 
 
@@ -63,7 +67,7 @@ def build_server(engine: GraphEngine, name: str = "context-graph") -> Server:
                     "properties": {
                         "operation": {
                             "type": "string",
-                            "enum": ["get_node", "get_neighbors", "shortest_path", "graph_stats"],
+                            "description": "The graph operation name to invoke.",
                         },
                         "params": {"type": "object"},
                     },
@@ -78,11 +82,11 @@ def build_server(engine: GraphEngine, name: str = "context-graph") -> Server:
             if name == "search":
                 query = arguments["query"]
                 limit = int(arguments.get("limit", 10))
-                result = engine.search(query, limit=limit)
+                result = await engine.search(query, limit=limit)
             elif name == "execute":
                 operation = arguments["operation"]
                 params = arguments.get("params", {})
-                result = engine.execute(operation, params)
+                result = await engine.execute(operation, params)
             else:
                 return [
                     types.TextContent(

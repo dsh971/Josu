@@ -338,7 +338,7 @@ def _adapter_config():
 
 def test_run_produces_valid_result_when_everything_checks_out(fake_claude_bin, git_repo, tmp_path, monkeypatch):
     worktree = create_worktree(git_repo, tmp_path / "worktrees")
-    manifest = write_manifest(worktree.path, "127.0.0.1", 8765)
+    manifest = write_manifest(worktree.path, "127.0.0.1", 8765, "test-token")
 
     stdout_file = tmp_path / "stdout.jsonl"
     stdout_file.write_text(
@@ -369,7 +369,7 @@ def test_run_raises_when_system_init_does_not_confirm_both_servers(
     fake_claude_bin, git_repo, tmp_path, monkeypatch
 ):
     worktree = create_worktree(git_repo, tmp_path / "worktrees")
-    manifest = write_manifest(worktree.path, "127.0.0.1", 8765)
+    manifest = write_manifest(worktree.path, "127.0.0.1", 8765, "test-token")
 
     stdout_file = tmp_path / "stdout.jsonl"
     stdout_file.write_text(
@@ -400,7 +400,7 @@ def test_run_surfaces_git_allowlist_violation_even_when_mcp_connectivity_also_fa
     this scenario would have raised MCPServerConnectionError instead,
     masking the fact that something unsafe also happened in the worktree."""
     worktree = create_worktree(git_repo, tmp_path / "worktrees")
-    manifest = write_manifest(worktree.path, "127.0.0.1", 8765)
+    manifest = write_manifest(worktree.path, "127.0.0.1", 8765, "test-token")
 
     stdout_file = tmp_path / "stdout.jsonl"
     stdout_file.write_text(
@@ -433,7 +433,7 @@ def test_run_rejects_out_of_worktree_path_even_though_cli_tool_call_claimed_succ
     -- here the fake CLI's stream-json output reports a successful Edit tool
     call against a path outside the worktree, and run() must still reject it."""
     worktree = create_worktree(git_repo, tmp_path / "worktrees")
-    manifest = write_manifest(worktree.path, "127.0.0.1", 8765)
+    manifest = write_manifest(worktree.path, "127.0.0.1", 8765, "test-token")
 
     outside_path = tmp_path / "outside-the-worktree.py"
     outside_path.write_text("# sensitive\n", encoding="utf-8")
@@ -469,7 +469,7 @@ def test_run_rejects_a_recorded_git_push_even_if_allowedtools_should_have_blocke
     Bash(git push) call is rejected even though the CLI's own tool_use event
     claims to have made the call."""
     worktree = create_worktree(git_repo, tmp_path / "worktrees")
-    manifest = write_manifest(worktree.path, "127.0.0.1", 8765)
+    manifest = write_manifest(worktree.path, "127.0.0.1", 8765, "test-token")
 
     stdout_file = tmp_path / "stdout.jsonl"
     stdout_file.write_text(
@@ -498,7 +498,7 @@ def test_run_rejects_a_staged_project_root_config_override(
     fake_claude_bin, git_repo, tmp_path, monkeypatch
 ):
     worktree = create_worktree(git_repo, tmp_path / "worktrees")
-    manifest = write_manifest(worktree.path, "127.0.0.1", 8765)
+    manifest = write_manifest(worktree.path, "127.0.0.1", 8765, "test-token")
 
     config_path = worktree.path / "josu.toml"
     config_path.write_text("allow_remote = false\n", encoding="utf-8")
@@ -524,7 +524,7 @@ def test_run_invokes_claude_with_the_declarative_argv_and_no_bypass_flags(
     fake_claude_bin, git_repo, tmp_path, monkeypatch
 ):
     worktree = create_worktree(git_repo, tmp_path / "worktrees")
-    manifest = write_manifest(worktree.path, "127.0.0.1", 8765)
+    manifest = write_manifest(worktree.path, "127.0.0.1", 8765, "test-token")
 
     argv_log = tmp_path / "argv.json"
     monkeypatch.setenv("FAKE_CLAUDE_ARGV_LOG", str(argv_log))

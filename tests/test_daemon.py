@@ -2,23 +2,26 @@
 servers over actual HTTP/SSE, connected to via the MCP SDK's own SSE
 client -- not mocked, this is the real transport path Claude Code will use.
 
-U12: the daemon now loads `josu.toml` (via `config/__init__.py`, composing
-U11's candidate registry and U3's fallback chains) at startup and passes it
-into the delegate server's construction, replacing the single hardcoded
-`delegate_model` string U1/U2 shipped with -- these tests exercise that via
-a real fixture `josu.toml` on disk, not an in-memory shortcut, since
-"starts end-to-end from a fixture josu.toml" is this unit's own
-verification bar.
+U15: `create_app()` now needs a reachable gortex to construct `GortexEngine`
+against. These tests pass the `gortex_process` test seam pointed at a real,
+locally-bound fixture HTTP server standing in for gortex's own
+`/v1/tools/{name}` surface (mirroring `tests/graph/test_gortex.py`'s and
+`tests/delegate/test_client.py`'s fixture-server convention) -- no real
+`gortex` binary needed for these tests, and no mocking of the daemon's own
+HTTP/SSE transport.
+
+Every route now requires the daemon's shared-secret auth token
+(`daemon_auth.py`) -- these tests resolve it the same way a real caller
+would, via `daemon_auth.resolve_daemon_token(config_path)`.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import os
-import socket
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
@@ -29,12 +32,10 @@ from mcp.client.sse import sse_client
 
 from josu.config import load_config
 from josu.daemon import DEFAULT_HOST, DEFAULT_PORT, create_app
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+from josu.daemon_auth import resolve_daemon_token
+from josu.graph.gortex_process import GortexProcess
+from tests.conftest import daemon_thread as _daemon_thread
+from tests.conftest import free_port as _free_port
 
 
 @pytest.fixture
@@ -45,6 +46,41 @@ def fixture_repo(tmp_path):
         "def greet(name):\n    return f'Hello, {name}!'\n", encoding="utf-8"
     )
     return repo
+
+
+@pytest.fixture
+def fake_gortex_server():
+    """A real HTTP server standing in for gortex's `/v1/tools/{name}`
+    surface, returning one canned "greet" search result for any `search`
+    call and an empty result for anything else -- enough for these
+    transport-level daemon tests, which care about the SSE/HTTP plumbing
+    reaching the engine, not gortex's own query semantics (covered
+    separately in `tests/graph/test_gortex.py`)."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path == "/v1/tools/search":
+                body = {"results": [{"id": "helper.py::greet"}]}
+            else:
+                body = {"status": "ok"}
+            payload = json.dumps(body).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+
+    yield GortexProcess(host="127.0.0.1", port=httpd.server_port, popen=None)
+
+    httpd.shutdown()
+    thread.join()
 
 
 def _write_fixture_josu_toml(path, *, second_candidate=False) -> None:
@@ -90,17 +126,17 @@ def fixture_config_path(tmp_path):
     return config_path
 
 
+@pytest.fixture
+def daemon_token(fixture_config_path):
+    return resolve_daemon_token(fixture_config_path)
+
+
 @pytest_asyncio.fixture
-async def running_daemon(tmp_path, fixture_repo, fixture_config_path):
-    # Build the graph before the server starts, mirroring how josu init
-    # would build it once before the daemon comes up.
-    from josu.graph.build import GraphifyEngine
-
-    graph_out = tmp_path / "graphify-out"
-    GraphifyEngine(out_dir=graph_out).build(fixture_repo)
-
+async def running_daemon(tmp_path, fixture_repo, fixture_config_path, fake_gortex_server):
     port = _free_port()
-    app = create_app(graph_out, config_path=fixture_config_path)
+    app = create_app(
+        target=fixture_repo, config_path=fixture_config_path, gortex_process=fake_gortex_server
+    )
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
     server = uvicorn.Server(config)
     task = asyncio.create_task(server.serve())
@@ -114,8 +150,9 @@ async def running_daemon(tmp_path, fixture_repo, fixture_config_path):
 
 
 @pytest.mark.asyncio
-async def test_daemon_serves_graph_mcp_over_real_http(running_daemon):
-    async with sse_client(f"{running_daemon}/graph/sse") as (read, write):
+async def test_daemon_serves_graph_mcp_over_real_http(running_daemon, daemon_token):
+    token = daemon_token
+    async with sse_client(f"{running_daemon}/graph/sse?token={token}") as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools = await session.list_tools()
@@ -123,20 +160,143 @@ async def test_daemon_serves_graph_mcp_over_real_http(running_daemon):
 
             result = await session.call_tool("search", {"query": "greet"})
             assert len(result.content) > 0
-
-
-def test_create_app_builds_graph_when_missing(tmp_path, fixture_repo, fixture_config_path):
-    graph_out = tmp_path / "graphify-out"
-    assert not graph_out.exists()
-
-    create_app(graph_out, target=fixture_repo, config_path=fixture_config_path)
-
-    assert (graph_out / "graph.json").exists()
+            assert "greet" in result.content[0].text.lower()
 
 
 @pytest.mark.asyncio
-async def test_daemon_serves_delegate_mcp_over_real_http(running_daemon):
-    async with sse_client(f"{running_daemon}/delegate/sse") as (read, write):
+async def test_daemon_route_rejects_missing_or_wrong_token(running_daemon):
+    async with httpx.AsyncClient(base_url=running_daemon) as client:
+        response = await client.post(
+            "/delegate/internal",
+            json={"task": "anything", "task_type": "file_summarization"},
+        )
+        assert response.status_code == 401
+
+        response = await client.post(
+            "/delegate/internal",
+            json={"task": "anything", "task_type": "file_summarization"},
+            headers={"Authorization": "Bearer totally-wrong-token"},
+        )
+        assert response.status_code == 401
+
+
+def test_create_app_constructs_gortex_engine_without_blocking_on_full_index(
+    tmp_path, fixture_repo, fixture_config_path, fake_gortex_server
+):
+    """Key Technical Decisions: `create_app()` blocks on the gortex
+    subprocess's `/healthz` liveness only (satisfied here by the fixture
+    server always answering), never on a full index completing -- there is
+    no `engine.build()` call at startup at all for `GortexEngine` (gortex
+    indexes the path it was spawned with as part of starting up)."""
+    app = create_app(
+        target=fixture_repo, config_path=fixture_config_path, gortex_process=fake_gortex_server
+    )
+    assert app is not None
+
+
+def test_create_app_terminates_a_process_it_spawned_if_construction_fails_after(
+    tmp_path, fixture_repo, fixture_config_path, monkeypatch
+):
+    """A gortex subprocess `create_app()` itself spawned (not the test-seam
+    `gortex_process` handle) must not be leaked if something after the
+    spawn raises -- e.g. a malformed config causing delegate-server
+    construction to fail. `terminate_gortex()` should still run even
+    though `lifespan`'s teardown never gets a chance to (the app was never
+    constructed)."""
+    import josu.daemon as daemon_module
+    from josu.graph.gortex_process import GortexProcess
+
+    terminated: list[GortexProcess] = []
+    fake_process = GortexProcess(host="127.0.0.1", port=1, popen=object())
+
+    monkeypatch.setattr(daemon_module, "_ensure_gortex_running", lambda *a, **k: fake_process)
+    monkeypatch.setattr(
+        daemon_module, "terminate_gortex", lambda p: terminated.append(p)
+    )
+
+    def _boom(**kwargs):
+        raise RuntimeError("simulated failure constructing the delegate server")
+
+    monkeypatch.setattr(daemon_module, "build_delegate_server", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        create_app(target=fixture_repo, config_path=fixture_config_path)
+
+    assert terminated == [fake_process]
+
+
+def test_create_app_does_not_terminate_a_caller_supplied_process_if_construction_fails(
+    fixture_repo, fixture_config_path, fake_gortex_server, monkeypatch
+):
+    """Complements the test above: a `gortex_process` the CALLER supplied
+    (the test seam) is never this `create_app()` call's to terminate, even
+    when construction fails after it -- this daemon instance didn't spawn
+    it (see `daemon.py`'s `owns_gortex_process` flag, reliability-review
+    fix). Regression coverage for the asymmetry that fix closed: the
+    construction-failure branch already guarded on this correctly before
+    the fix; only `lifespan`'s clean-shutdown teardown didn't."""
+    import josu.daemon as daemon_module
+
+    terminated: list = []
+    monkeypatch.setattr(
+        daemon_module, "terminate_gortex", lambda p: terminated.append(p)
+    )
+
+    def _boom(**kwargs):
+        raise RuntimeError("simulated failure constructing the delegate server")
+
+    monkeypatch.setattr(daemon_module, "build_delegate_server", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        create_app(
+            target=fixture_repo,
+            config_path=fixture_config_path,
+            gortex_process=fake_gortex_server,
+        )
+
+    assert terminated == []
+
+
+@pytest.mark.asyncio
+async def test_lifespan_teardown_does_not_terminate_a_caller_supplied_process(
+    fixture_repo, fixture_config_path, fake_gortex_server, monkeypatch
+):
+    """Regression coverage for the `lifespan`-teardown half of the same
+    `owns_gortex_process` fix: a real uvicorn server, constructed with a
+    caller-supplied `gortex_process`, taken through a full clean
+    start-then-shutdown cycle (the actual ASGI lifespan path, not a direct
+    call to the `lifespan` context manager) must not call `terminate_gortex`
+    on that process during shutdown -- before the fix, `lifespan`'s
+    teardown called it unconditionally."""
+    import josu.daemon as daemon_module
+
+    terminated: list = []
+    monkeypatch.setattr(
+        daemon_module, "terminate_gortex", lambda p: terminated.append(p)
+    )
+
+    port = _free_port()
+    app = create_app(
+        target=fixture_repo, config_path=fixture_config_path, gortex_process=fake_gortex_server
+    )
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    task = asyncio.create_task(server.serve())
+    for _ in range(50):
+        if server.started:
+            break
+        await asyncio.sleep(0.05)
+
+    server.should_exit = True
+    await task
+
+    assert terminated == []
+
+
+@pytest.mark.asyncio
+async def test_daemon_serves_delegate_mcp_over_real_http(running_daemon, daemon_token):
+    token = daemon_token
+    async with sse_client(f"{running_daemon}/delegate/sse?token={token}") as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools = await session.list_tools()
@@ -154,14 +314,13 @@ async def test_daemon_serves_delegate_mcp_over_real_http(running_daemon):
 
 
 def test_daemon_starts_end_to_end_from_a_fixture_josu_toml_with_two_candidates(
-    tmp_path, fixture_repo
+    tmp_path, fixture_repo, fake_gortex_server
 ):
     """Covers: starting the daemon with a `josu.toml` defining two
     candidates constructs a delegate server that can resolve chains for
     both, without a hardcoded single-model parameter."""
     config_path = tmp_path / "josu.toml"
     _write_fixture_josu_toml(config_path, second_candidate=True)
-    graph_out = tmp_path / "graphify-out"
 
     config = load_config(config_path)
     assert {c.name for c in config.delegate.candidates} == {"local-ollama", "remote-example"}
@@ -179,7 +338,7 @@ def test_daemon_starts_end_to_end_from_a_fixture_josu_toml_with_two_candidates(
 
     # And the daemon itself constructs cleanly from this same two-candidate
     # config -- no hardcoded single `delegate_model` parameter anywhere.
-    app = create_app(graph_out, target=fixture_repo, config=config)
+    app = create_app(target=fixture_repo, config=config, gortex_process=fake_gortex_server)
     assert app is not None
 
 
@@ -187,10 +346,13 @@ def test_daemon_starts_end_to_end_from_a_fixture_josu_toml_with_two_candidates(
 
 
 @pytest.mark.asyncio
-async def test_daemon_serves_internal_delegate_route_over_real_http(running_daemon):
-    """A real HTTP POST to `/delegate/internal` (the new U14 endpoint)
-    against the running daemon resolves against its real fixture config,
-    the same as the MCP tool does, over the same loopback-TCP listener."""
+async def test_daemon_serves_internal_delegate_route_over_real_http(
+    running_daemon, daemon_token
+):
+    """A real HTTP POST to `/delegate/internal` (the U14 endpoint) against
+    the running daemon resolves against its real fixture config, the same
+    as the MCP tool does, over the same loopback-TCP listener."""
+    token = daemon_token
     async with httpx.AsyncClient(base_url=running_daemon) as client:
         response = await client.post(
             "/delegate/internal",
@@ -198,61 +360,31 @@ async def test_daemon_serves_internal_delegate_route_over_real_http(running_daem
                 "task": "Reply with the single word: pong. No punctuation.",
                 "task_type": "file_summarization",
             },
+            headers={"Authorization": f"Bearer {token}"},
         )
     assert response.status_code == 200
     body = response.json()
     assert "pong" in body["result"].lower()
 
 
-@contextlib.contextmanager
-def _daemon_thread(app, host: str, port: int):
-    """Serve `app` via a real `uvicorn` server on its own background thread
-    with its OWN event loop -- distinct from the current test's event loop
-    (if any). Needed because `cli.py`'s `_cmd_delegate` and
-    `watchers.py`'s `_run_commit_hook_from_cli()` are themselves
-    `asyncio.run()`-wrapped sync entry points (mirroring their real,
-    separate-OS-process production shape); calling `asyncio.run()` from
-    inside an already-running event loop raises, so the daemon under test
-    genuinely needs its own thread/loop, not just a `create_task()` in the
-    caller's loop the way `running_daemon` above does."""
-    ready = threading.Event()
-    stop = threading.Event()
-    errors: list[BaseException] = []
-
-    def _run() -> None:
-        async def _serve() -> None:
-            config = uvicorn.Config(app, host=host, port=port, log_level="warning")
-            server = uvicorn.Server(config)
-            serve_task = asyncio.ensure_future(server.serve())
-            for _ in range(200):
-                if server.started:
-                    break
-                await asyncio.sleep(0.02)
-            ready.set()
-            while not stop.is_set():
-                await asyncio.sleep(0.02)
-            server.should_exit = True
-            await serve_task
-
-        try:
-            asyncio.run(_serve())
-        except BaseException as exc:  # pragma: no cover - surfaced via `errors`
-            errors.append(exc)
-            ready.set()
-
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-    if not ready.wait(timeout=10):
-        stop.set()
-        thread.join(timeout=5)
-        raise RuntimeError("daemon thread failed to start in time")
-    if errors:
-        raise errors[0]
-    try:
-        yield
-    finally:
-        stop.set()
-        thread.join(timeout=10)
+@pytest.mark.asyncio
+async def test_daemon_serves_internal_graph_reindex_route_over_real_http(
+    running_daemon, daemon_token, fixture_repo
+):
+    """The new `/graph/internal/reindex` route (doc-review bug fix) reaches
+    the daemon's own live `GortexEngine` -- proven here by asserting the
+    fixture gortex server actually received the `reindex_repository` call
+    with the changed-file paths, not a throwaway engine instance."""
+    token = daemon_token
+    changed_file = str(fixture_repo / "helper.py")
+    async with httpx.AsyncClient(base_url=running_daemon) as client:
+        response = await client.post(
+            "/graph/internal/reindex",
+            json={"root": str(fixture_repo), "changed_files": [changed_file]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
 
 
 def test_josu_delegate_cli_with_no_daemon_running_produces_clear_error(capsys):
@@ -281,7 +413,7 @@ def test_josu_delegate_cli_with_no_daemon_running_produces_clear_error(capsys):
 
 
 def test_josu_delegate_cli_routes_through_the_running_daemon_over_real_http(
-    tmp_path, fixture_repo, fixture_config_path, capsys
+    tmp_path, fixture_repo, fixture_config_path, fake_gortex_server, capsys
 ):
     """U14's own verification bar: `josu delegate` and a running daemon,
     connected over real HTTP -- not an in-process shortcut."""
@@ -289,14 +421,15 @@ def test_josu_delegate_cli_routes_through_the_running_daemon_over_real_http(
 
     from josu.cli import _cmd_delegate
 
-    graph_out = tmp_path / "graphify-out"
-    app = create_app(graph_out, target=fixture_repo, config_path=fixture_config_path)
+    app = create_app(
+        target=fixture_repo, config_path=fixture_config_path, gortex_process=fake_gortex_server
+    )
 
     with _daemon_thread(app, DEFAULT_HOST, DEFAULT_PORT):
         args = argparse.Namespace(
             task_type="file_summarization",
             task="Reply with the single word: pong. No punctuation.",
-            config=None,
+            config=str(fixture_config_path),
             host=None,
             port=None,
         )
@@ -308,7 +441,7 @@ def test_josu_delegate_cli_routes_through_the_running_daemon_over_real_http(
 
 
 def test_commit_hook_r39_survives_the_daemon_route_even_with_allow_remote_true_and_remote_ranked_first(
-    tmp_path, fixture_repo, monkeypatch, capsys
+    tmp_path, fixture_repo, fake_gortex_server, monkeypatch, capsys
 ):
     """U14's core safety proof: even with the daemon's REAL config setting
     `allow_remote = true` globally and ranking a remote candidate FIRST for
@@ -363,13 +496,13 @@ explicit_order = true
     )
     os.chmod(config_path, 0o600)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_home))
+    monkeypatch.chdir(fixture_repo)
 
-    graph_out = tmp_path / "graphify-out"
     app = create_app(
-        graph_out,
         target=fixture_repo,
         config_path=config_path,
         delegate_client_factory=client_factory,
+        gortex_process=fake_gortex_server,
     )
 
     with _daemon_thread(app, DEFAULT_HOST, DEFAULT_PORT):
