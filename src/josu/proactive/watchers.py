@@ -73,6 +73,7 @@ from josu.config.chains import (
 )
 from josu.config.delegate import DelegateCandidate
 from josu.delegate.chain import ClientFactory, execute_chain
+from josu.delegate.cooldown import CandidateCooldownStore
 from josu.delegate.local_model import DEFAULT_TIMEOUT_SECONDS, DelegateResult
 from josu.delegate.queue import DelegateQueue
 from josu.graph.engine import GraphEngine
@@ -247,6 +248,7 @@ async def run_proactive_check(
     chains_config: ChainsConfig,
     registry: Mapping[str, DelegateCandidate],
     queue: DelegateQueue,
+    cooldown_store: CandidateCooldownStore,
     graph_engine: GraphEngine | None = None,
     scope_root: Path | None = None,
     client_factory: ClientFactory | None = None,
@@ -278,6 +280,13 @@ async def run_proactive_check(
     swallow or reinterpret those. `NoCandidatesError` should be unreachable
     in practice here specifically BECAUSE step 1 already guarantees at
     least one candidate before `execute_chain()` is ever called.
+
+    `cooldown_store` (feat/delegate-candidate-circuit-breaker plan), like
+    `queue`, is caller-supplied rather than internally constructed -- this
+    function has no in-repo production caller today (confirmed by that
+    plan's Scope Boundaries; production proactive checks run through
+    `internal_api.py`'s HTTP route instead), so there is no daemon-shared
+    instance to thread through here.
     """
     local_chains_config, local_registry = _local_only_execution_inputs(chains_config, registry)
     if local_chains_config is None:
@@ -290,6 +299,7 @@ async def run_proactive_check(
         chains_config=local_chains_config,
         registry=local_registry,
         queue=queue,
+        cooldown_store=cooldown_store,
         graph_engine=graph_engine,
         scope_root=scope_root,
         client_factory=client_factory,

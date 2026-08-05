@@ -32,6 +32,7 @@ readers simply look at different keys of the same section.
 
 from __future__ import annotations
 
+import math
 import os
 import stat
 import tomllib
@@ -52,6 +53,18 @@ DEFAULT_CONFIG_FILENAME = "josu.toml"
 # bounded task; override via `[orchestrator] wall_clock_timeout_seconds` in
 # `josu.toml`.
 DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS: float = 20 * 60
+
+# delegate/cooldown.py's per-candidate circuit breaker (feat/delegate-
+# candidate-circuit-breaker plan): three consecutive qualifying failures is
+# enough to react to a genuinely dead candidate without tripping on one
+# transient blip. 60 seconds matches `local_model.py`'s own
+# `DEFAULT_TIMEOUT_SECONDS` (one delegate call's own budget) -- long enough
+# to meaningfully skip several subsequent tasks while a candidate is down,
+# short enough that a transient outage self-heals without a daemon restart.
+# Override via `[delegate] failure_threshold`/`cooldown_seconds` in
+# `josu.toml`.
+DEFAULT_CANDIDATE_FAILURE_THRESHOLD: int = 3
+DEFAULT_CANDIDATE_COOLDOWN_SECONDS: float = 60.0
 
 # Bits that mean "readable/writable/executable by group or other" -- the
 # same class of bit `ssh` warns/refuses on for private key files.
@@ -106,6 +119,8 @@ class JosuConfig:
     chains: ChainsConfig = field(default_factory=ChainsConfig)
     orchestrator: OrchestratorConfig = field(default_factory=OrchestratorConfig)
     wall_clock_timeout_seconds: float = DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS
+    candidate_failure_threshold: int = DEFAULT_CANDIDATE_FAILURE_THRESHOLD
+    candidate_cooldown_seconds: float = DEFAULT_CANDIDATE_COOLDOWN_SECONDS
     warnings: list[str] = field(default_factory=list)
 
 
@@ -135,16 +150,101 @@ def _load_wall_clock_timeout_seconds(data: dict) -> tuple[float, list[str]]:
             ],
         )
 
-    if value <= 0:
+    # `<= 0` alone doesn't reject `nan`/`inf` (code-review fix, found via
+    # the identical gap in `_load_delegate_cooldown_config()` below): NaN
+    # comparisons are always False and `inf > 0` is True, so a `wall_clock_
+    # timeout_seconds = inf` TOML value would silently pass through and
+    # become `CircuitBreaker.timeout_seconds` -- whose own `elapsed >
+    # timeout_seconds` trip condition is also always False for inf/nan,
+    # permanently disabling R23's whole-run safety net with no warning.
+    if not math.isfinite(value) or value <= 0:
         return (
             DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS,
             [
-                f"orchestrator.wall_clock_timeout_seconds {value!r} must be positive -- "
-                f"falling back to the default ({DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS}s)"
+                f"orchestrator.wall_clock_timeout_seconds {value!r} must be a positive, "
+                f"finite number -- falling back to the default "
+                f"({DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS}s)"
             ],
         )
 
     return value, []
+
+
+def _load_delegate_cooldown_config(data: dict) -> tuple[int, float, list[str]]:
+    """Read `[delegate].failure_threshold`/`[delegate].cooldown_seconds`
+    (feat/delegate-candidate-circuit-breaker plan) directly from the raw
+    parsed TOML, mirroring `_load_wall_clock_timeout_seconds()`'s exact
+    convention -- `[delegate]` already hosts `[[delegate.candidates]]` as an
+    array-of-tables, and TOML allows a table's own scalar keys to cohabit
+    with an array-of-tables it also defines, the same way `[orchestrator]`
+    hosts both `wall_clock_timeout_seconds` and `[[orchestrator.adapters]]`.
+    A missing key falls back to its default silently; a present-but-invalid
+    value (non-numeric, `<= 0`) falls back to its default with a warning,
+    never crashing config load. The two values are read together since both
+    live in `[delegate]` and are validated the same way.
+    """
+    section = data.get("delegate", {})
+    if not isinstance(section, dict):
+        section = {}
+
+    warnings: list[str] = []
+
+    if "failure_threshold" not in section:
+        failure_threshold = DEFAULT_CANDIDATE_FAILURE_THRESHOLD
+    else:
+        raw_threshold = section["failure_threshold"]
+        try:
+            # TOML permits an unquoted `inf` float literal for a key a
+            # developer intended as an integer -- `int(raw_threshold)`
+            # raises `OverflowError` for that, not `ValueError` (code-
+            # review fix), which would otherwise propagate uncaught and
+            # crash `load_config()`/daemon startup entirely rather than
+            # degrading this one value like every other invalid input here.
+            failure_threshold = int(raw_threshold)
+        except (TypeError, ValueError, OverflowError):
+            failure_threshold = DEFAULT_CANDIDATE_FAILURE_THRESHOLD
+            warnings.append(
+                f"delegate.failure_threshold {raw_threshold!r} is not a number -- "
+                f"falling back to the default ({DEFAULT_CANDIDATE_FAILURE_THRESHOLD})"
+            )
+        else:
+            if failure_threshold <= 0:
+                warnings.append(
+                    f"delegate.failure_threshold {failure_threshold!r} must be positive -- "
+                    f"falling back to the default ({DEFAULT_CANDIDATE_FAILURE_THRESHOLD})"
+                )
+                failure_threshold = DEFAULT_CANDIDATE_FAILURE_THRESHOLD
+
+    if "cooldown_seconds" not in section:
+        cooldown_seconds = DEFAULT_CANDIDATE_COOLDOWN_SECONDS
+    else:
+        raw_cooldown = section["cooldown_seconds"]
+        try:
+            cooldown_seconds = float(raw_cooldown)
+        except (TypeError, ValueError):
+            cooldown_seconds = DEFAULT_CANDIDATE_COOLDOWN_SECONDS
+            warnings.append(
+                f"delegate.cooldown_seconds {raw_cooldown!r} is not a number -- "
+                f"falling back to the default ({DEFAULT_CANDIDATE_COOLDOWN_SECONDS}s)"
+            )
+        else:
+            # `<= 0` alone doesn't reject `nan`/`inf` (code-review fix):
+            # NaN comparisons are always False, and `inf > 0` is True, so
+            # TOML's unquoted `nan`/`inf` float literals would otherwise
+            # slide through as "valid" -- a `nan` cooldown makes
+            # `is_in_cooldown()`'s clock comparison always False (the
+            # breaker silently never trips), and `inf` makes it always
+            # True once tripped (permanently excluded until a daemon
+            # restart, with no warning this is what a typo just did).
+            if not math.isfinite(cooldown_seconds) or cooldown_seconds <= 0:
+                warnings.append(
+                    f"delegate.cooldown_seconds {cooldown_seconds!r} must be a positive, "
+                    f"finite number -- falling back to the default "
+                    f"({DEFAULT_CANDIDATE_COOLDOWN_SECONDS}s)"
+                )
+                cooldown_seconds = DEFAULT_CANDIDATE_COOLDOWN_SECONDS
+
+    return failure_threshold, cooldown_seconds, warnings
 
 
 def load_config(path: Path | None = None, *, strict: bool = False) -> JosuConfig:
@@ -194,11 +294,18 @@ def load_config(path: Path | None = None, *, strict: bool = False) -> JosuConfig
     wall_clock_timeout_seconds, wall_clock_warnings = _load_wall_clock_timeout_seconds(data)
     warnings.extend(wall_clock_warnings)
 
+    candidate_failure_threshold, candidate_cooldown_seconds, cooldown_warnings = (
+        _load_delegate_cooldown_config(data)
+    )
+    warnings.extend(cooldown_warnings)
+
     return JosuConfig(
         path=resolved,
         delegate=delegate_config,
         chains=chains_config,
         orchestrator=orchestrator_config,
         wall_clock_timeout_seconds=wall_clock_timeout_seconds,
+        candidate_failure_threshold=candidate_failure_threshold,
+        candidate_cooldown_seconds=candidate_cooldown_seconds,
         warnings=warnings,
     )

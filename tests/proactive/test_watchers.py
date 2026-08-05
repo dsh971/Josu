@@ -35,6 +35,7 @@ from josu.config.chains import (
     DelegationChain,
 )
 from josu.config.delegate import DelegateCandidate
+from josu.delegate.cooldown import CandidateCooldownStore
 from josu.delegate.queue import DelegateQueue
 from josu.proactive.watchers import (
     DebouncedSaveWatcher,
@@ -159,6 +160,7 @@ def test_debounced_save_event_triggers_local_only_check():
                 chains_config=chains_config,
                 registry=registry,
                 queue=DelegateQueue(),
+                cooldown_store=CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0),
                 client_factory=_factory({candidate.name: client}),
             )
         )
@@ -220,6 +222,7 @@ async def test_commit_triggered_check_with_no_serious_finding_never_invokes_clau
         chains_config=_chains_config([candidate.name]),
         registry={candidate.name: candidate},
         queue=DelegateQueue(),
+        cooldown_store=CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0),
         client_factory=_factory({candidate.name: client}),
         claude_code_invoker=invoker,
     )
@@ -247,6 +250,7 @@ async def test_serious_finding_invokes_full_claude_code_loop():
         chains_config=_chains_config([candidate.name]),
         registry={candidate.name: candidate},
         queue=DelegateQueue(),
+        cooldown_store=CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0),
         client_factory=_factory({candidate.name: client}),
         claude_code_invoker=invoker,
     )
@@ -305,6 +309,7 @@ async def test_query_on_demand_is_the_same_function_and_independently_callable()
         chains_config=_chains_config([candidate.name]),
         registry={candidate.name: candidate},
         queue=DelegateQueue(),
+        cooldown_store=CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0),
         client_factory=_factory({candidate.name: client}),
     )
 
@@ -331,6 +336,7 @@ async def test_save_event_with_only_remote_candidate_configured_is_skipped_not_c
         chains_config=chains_config,
         registry={"remote-only": remote_candidate},
         queue=DelegateQueue(),
+        cooldown_store=CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0),
         client_factory=_factory({"remote-only": remote_client}),
     )
 

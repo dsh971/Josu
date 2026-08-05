@@ -18,6 +18,7 @@ import pytest
 from josu.config.chains import ChainsConfig, DelegationChain
 from josu.config.delegate import DelegateCandidate
 from josu.delegate.chain import ChainExhaustedError, NoCandidatesError
+from josu.delegate.cooldown import CandidateCooldownStore
 from josu.delegate.queue import DelegateQueue
 from josu.fallback.quota import (
     ABANDON_REASON_QUOTA_EXHAUSTION,
@@ -108,6 +109,7 @@ async def test_quota_signal_routes_bounded_request_directly_with_hosted_paused_m
         chains_config=_chains_config(BOUNDED_TASK_TYPE, ["local-good"]),
         registry={candidate.name: candidate},
         queue=DelegateQueue(),
+        cooldown_store=CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0),
         client_factory=_factory({"local-good": good_client}),
     )
 
@@ -211,6 +213,7 @@ async def test_non_bounded_task_type_during_outage_is_told_to_wait_not_attempted
             chains_config=ChainsConfig(),
             registry={},
             queue=DelegateQueue(),
+            cooldown_store=CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0),
         )
 
     assert exc_info.value.task_type == HOSTED_ONLY_TASK_TYPE
@@ -233,6 +236,7 @@ async def test_non_bounded_task_type_never_reaches_execute_chain(tmp_path):
             chains_config=_chains_config(HOSTED_ONLY_TASK_TYPE, ["would-be-used"]),
             registry={candidate.name: candidate},
             queue=DelegateQueue(),
+            cooldown_store=CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0),
             client_factory=_factory({"would-be-used": client}),
         )
 
@@ -258,6 +262,7 @@ async def test_bounded_request_completes_without_any_worktree_or_orchestrator_im
         chains_config=_chains_config(BOUNDED_TASK_TYPE, ["solo"]),
         registry={candidate.name: candidate},
         queue=DelegateQueue(),
+        cooldown_store=CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0),
         client_factory=_factory({"solo": good_client}),
     )
 
@@ -276,6 +281,7 @@ async def test_chain_exhausted_propagates_unchanged_through_fallback_path():
             chains_config=ChainsConfig(),  # no chain configured at all
             registry={},
             queue=DelegateQueue(),
+            cooldown_store=CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0),
         )
 
 

@@ -24,6 +24,7 @@ from starlette.requests import Request
 from josu.config.chains import ChainsConfig, DelegationChain
 from josu.config.delegate import DelegateCandidate
 from josu.delegate.client import DelegateUnreachableError
+from josu.delegate.cooldown import CandidateCooldownStore
 from josu.delegate.internal_api import (
     DELEGATE_INTERNAL_PATH,
     MAX_BODY_BYTES,
@@ -96,6 +97,7 @@ def _app_and_queue(*, chains_config=None, registry=None, client_factory=None, qu
     )
     route = build_delegate_internal_route(
         queue=queue,
+        cooldown_store=CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0),
         chains_config=chains_config,
         registry=registry,
         client_factory=client_factory,
@@ -367,6 +369,7 @@ async def test_oversized_body_with_content_length_header_is_rejected_without_rea
     the body would fail the test rather than merely being slow."""
     route = build_delegate_internal_route(
         queue=DelegateQueue(),
+        cooldown_store=CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0),
         chains_config=ChainsConfig(
             chains=[DelegationChain(task_type=TASK_TYPE, candidates=["c1"])],
             allow_remote=True,
@@ -410,6 +413,7 @@ async def test_chunked_request_with_no_content_length_exceeding_cap_is_rejected_
     memory) once the cap was exceeded."""
     route = build_delegate_internal_route(
         queue=DelegateQueue(),
+        cooldown_store=CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0),
         chains_config=ChainsConfig(
             chains=[DelegationChain(task_type=TASK_TYPE, candidates=["c1"])],
             allow_remote=True,
@@ -516,6 +520,45 @@ async def test_both_task_type_and_candidates_given_is_a_structured_400():
     assert response.json()["error"] == "invalid_request"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_timeout", [0, -1, 601])
+async def test_invalid_timeout_is_rejected_with_a_structured_400(bad_timeout):
+    """Code-review fix: an unbounded `timeout` let a caller weaponize the
+    shared `cooldown_store` -- one request with a near-zero timeout against
+    a multi-candidate chain could fail every candidate almost instantly and
+    trip all of them into cooldown for every other caller. Non-positive and
+    too-large values are now rejected before `execute_chain()` is ever
+    called."""
+    app, _queue = _app_and_queue()
+    async with _client(app) as client:
+        response = await client.post(
+            DELEGATE_INTERNAL_PATH,
+            json={"task": "x", "task_type": TASK_TYPE, "timeout": bad_timeout},
+        )
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("literal", [b"NaN", b"Infinity", b"-Infinity"])
+async def test_non_finite_timeout_is_rejected_with_a_structured_400(literal):
+    """`json.loads()` accepts bare `NaN`/`Infinity`/`-Infinity` literals by
+    default (a non-standard Python extension), so this must be exercised
+    via a raw request body -- httpx's own `json=` convenience parameter
+    encodes with `allow_nan=False` and would raise client-side before the
+    request is even sent, never reaching the server's own validation."""
+    app, _queue = _app_and_queue()
+    async with _client(app) as client:
+        response = await client.post(
+            DELEGATE_INTERNAL_PATH,
+            content=b'{"task": "x", "task_type": "%s", "timeout": %s}'
+            % (TASK_TYPE.encode(), literal),
+            headers={"Content-Type": "application/json"},
+        )
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_request"
+
+
 # --- shared-queue serialization proofs ----------------------------------------
 
 
@@ -566,14 +609,17 @@ async def test_mcp_tool_and_internal_route_share_one_lock_real_race():
     )
     registry = {"c1": DelegateCandidate(name="c1", endpoint="http://x", local=True, model="m")}
 
+    shared_cooldown_store = CandidateCooldownStore(failure_threshold=3, cooldown_seconds=30.0)
     mcp_server = build_server(
         chains_config=chains_config,
         registry=registry,
         client_factory=lambda c: fake,
         queue=shared_queue,
+        cooldown_store=shared_cooldown_store,
     )
     route = build_delegate_internal_route(
         queue=shared_queue,
+        cooldown_store=shared_cooldown_store,
         chains_config=chains_config,
         registry=registry,
         client_factory=lambda c: fake,
