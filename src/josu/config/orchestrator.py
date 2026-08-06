@@ -41,6 +41,8 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError, field_validator
 
+from josu.config._validation import safe_validation_error_detail
+
 # Deliberately tiny allowlist, extended only when a second CLI orchestrator
 # actually clears the MCP-approval gate (see plan Scope Boundaries re: Codex
 # CLI being blocked on openai/codex#24135). This check is independent of --
@@ -202,7 +204,8 @@ def load_orchestrator_config(data: dict[str, Any]) -> tuple[OrchestratorConfig, 
             adapter = OrchestratorAdapterConfig.model_validate(entry)
         except ValidationError as exc:
             warnings.append(
-                f"orchestrator adapter {entry_name!r} rejected at load time: {exc}"
+                f"orchestrator adapter {entry_name!r} rejected at load time: "
+                f"{safe_validation_error_detail(exc)}"
             )
             continue
 

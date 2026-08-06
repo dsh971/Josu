@@ -125,6 +125,35 @@ def test_unset_api_key_env_warning_never_includes_the_secret_value(monkeypatch):
     assert "sk-must-not-appear-in-warning" not in joined
 
 
+def test_malformed_candidate_warning_never_includes_a_mistyped_secret_value():
+    """Code-review fix (feat/cli-ease-of-use plan): a candidate entry
+    missing a genuinely required field (here `endpoint`) AND carrying a
+    mistyped credential-shaped field (`api_key` instead of the schema's
+    actual `api_key_env`) used to leak that field's raw value into the
+    warning -- pydantic's default `ValidationError` rendering embeds the
+    *entire* input mapping's repr for a missing-field error, including
+    sibling fields the schema never asked about. This is a different path
+    than `test_unset_api_key_env_warning_never_includes_the_secret_value`
+    above (that one covers the env-var-existence check; this one covers
+    the schema-validation-failure path)."""
+    data = {
+        "delegate": {
+            "candidates": [
+                {
+                    "name": "remote-candidate",
+                    "local": False,
+                    "model": "some-model",
+                    "api_key": "sk-must-not-appear-in-warning",
+                },
+            ]
+        }
+    }
+    _, warnings = load_delegate_config(data)
+    assert len(warnings) == 1
+    assert "sk-must-not-appear-in-warning" not in warnings[0]
+    assert "endpoint" in warnings[0]  # still names the actual missing field
+
+
 def test_candidate_missing_required_field_raises():
     with pytest.raises(Exception):
         DelegateCandidate.model_validate({"name": "incomplete", "endpoint": "http://x"})
