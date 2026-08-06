@@ -199,7 +199,9 @@ def test_create_app_prints_no_warning_for_a_correctly_permissioned_config(
 ):
     """U4 (feat/cli-ease-of-use plan): a `josu.toml` with correct (0o600)
     permissions and no other warnings produces no warning output."""
-    create_app(target=fixture_repo, config_path=fixture_config_path, gortex_process=fake_gortex_server)
+    create_app(
+        target=fixture_repo, config_path=fixture_config_path, gortex_process=fake_gortex_server
+    )
     assert "warning:" not in capsys.readouterr().out
 
 
@@ -487,7 +489,9 @@ def test_cmd_delegate_prints_no_config_warning_even_when_misconfigured(
     _write_fixture_josu_toml(config_path)
     os.chmod(config_path, 0o644)
 
-    app = create_app(target=fixture_repo, config_path=config_path, gortex_process=fake_gortex_server)
+    app = create_app(
+        target=fixture_repo, config_path=config_path, gortex_process=fake_gortex_server
+    )
     capsys.readouterr()  # drain create_app()'s own startup warning print
 
     with _daemon_thread(app, DEFAULT_HOST, DEFAULT_PORT):

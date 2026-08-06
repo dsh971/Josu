@@ -25,13 +25,9 @@ from pydantic import ValidationError
 
 
 def safe_validation_error_detail(exc: ValidationError) -> str:
-    """Render `exc` as a warning-safe, human-readable detail string --
-    field path + reason for each error, never pydantic's raw `input_value`
-    (which can echo back sibling fields the schema didn't ask about,
-    including a mistyped credential value). A hand-written `raise
-    ValueError(...)` inside a `@field_validator` (e.g. the allowlist and
-    declarable-output-mode checks in `config/orchestrator.py`) still comes
-    through in full -- only pydantic's own opaque `input_value` dump is
-    suppressed, not messages this codebase authored itself."""
+    """Render `exc` as a field-path + reason string per error, omitting
+    pydantic's own `input_value` dump (see module docstring). A hand-written
+    `raise ValueError(...)` inside a `@field_validator` still comes through
+    in full -- only pydantic's own input echo is suppressed."""
     details = exc.errors(include_url=False, include_input=False)
     return "; ".join(f"{'.'.join(str(part) for part in d['loc'])}: {d['msg']}" for d in details)

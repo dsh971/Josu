@@ -141,12 +141,12 @@ def test_generic_exception_from_run_task_is_not_confused_with_the_specific_handl
 def test_cmd_run_prints_config_permission_warning(tmp_path, fake_daemon, monkeypatch, capsys):
     """feat/cli-ease-of-use plan (U4): `_cmd_run` loads config in-process
     (unlike `_cmd_delegate`, which never does -- see
-    `test_cmd_delegate_prints_no_config_warning_even_when_misconfigured`
-    below) and must surface `config.warnings` the same way the daemon
-    does. Uses this file's own `fake_daemon` real-TCP-listener fixture for
-    the reachability check, matching this repo's "prefer a real fixture
-    server over mocking the transport layer" testing convention, rather
-    than monkeypatching `check_daemon_reachable` directly."""
+    `tests/test_daemon.py::test_cmd_delegate_prints_no_config_warning_even_when_misconfigured`)
+    and must surface `config.warnings` the same way the daemon does. Uses
+    this file's own `fake_daemon` real-TCP-listener fixture for the
+    reachability check, matching this repo's "prefer a real fixture server
+    over mocking the transport layer" testing convention, rather than
+    monkeypatching `check_daemon_reachable` directly."""
     import josu.orchestrator.run as run_module
     from josu.cli import _cmd_run
 
@@ -169,8 +169,9 @@ def test_cmd_run_prints_config_permission_warning(tmp_path, fake_daemon, monkeyp
     host, port = fake_daemon
     args = _run_args(host=host, port=port, config_path=config_path)
 
-    _cmd_run(args)
+    exit_code = _cmd_run(args)
 
+    assert exit_code == 1
     out = capsys.readouterr().out
     assert "josu run: warning:" in out
     assert "group/world-accessible" in out
