@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from josu.config import resolve_config_path
+from josu.config.chains import DELEGABLE_TASK_TYPES
 from josu.daemon import DEFAULT_HOST, DEFAULT_PORT
 
 
@@ -334,7 +335,6 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
     """
     import asyncio
 
-    from josu.config.chains import DELEGABLE_TASK_TYPES
     from josu.daemon import DEFAULT_HOST, DEFAULT_PORT
     from josu.daemon_auth import resolve_daemon_token
     from josu.delegate.daemon_client import (
@@ -554,9 +554,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         default=None,
         help=(
-            "Path to josu.toml (candidate/chain config). Defaults to the "
-            "XDG-style location config/__init__.py resolves "
-            "(~/.config/josu/josu.toml, or $XDG_CONFIG_HOME/josu/josu.toml)."
+            "Path to josu.toml (candidate/chain config). Defaults to "
+            "~/.config/josu/josu.toml, or $XDG_CONFIG_HOME/josu/josu.toml if set."
         ),
     )
     start_parser.set_defaults(func=_cmd_daemon_start)
@@ -565,7 +564,7 @@ def build_parser() -> argparse.ArgumentParser:
         "init",
         help=(
             "Install the post-commit hook that drives commit-triggered "
-            "proactive checks (U9, R15) -- chains to an existing hook "
+            "proactive checks -- chains to an existing hook "
             "rather than overwriting it"
         ),
     )
@@ -595,15 +594,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Route a bounded task directly to the local delegate worker, "
             "bypassing the hosted orchestrator -- for use when Claude Code "
-            "is quota/rate-limit exhausted (U7, R28/R29)"
+            "is quota/rate-limit exhausted"
         ),
     )
     delegate_parser.add_argument(
         "task_type",
         help=(
-            "A config/chains.py DELEGABLE_TASK_TYPES category name "
-            "(e.g. file_summarization). A non-bounded task_type is refused, "
-            "not attempted locally."
+            "The task category to delegate -- one of: "
+            f"{', '.join(sorted(DELEGABLE_TASK_TYPES))}. A non-bounded "
+            "task_type is refused, not attempted locally."
         ),
     )
     delegate_parser.add_argument("task", help="The bounded task description to delegate")
@@ -611,11 +610,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         default=None,
         help=(
-            "Path to josu.toml (candidate/chain config). Defaults to the "
-            "XDG-style location config/__init__.py resolves. The daemon, not "
-            "this CLI process, loads the config itself (U14) -- this flag is "
-            "used here only to resolve the daemon's shared-secret auth token "
-            "file, which lives alongside josu.toml."
+            "Path to josu.toml (candidate/chain config). Defaults to "
+            "~/.config/josu/josu.toml, or $XDG_CONFIG_HOME/josu/josu.toml if set. "
+            "The daemon, not this CLI process, loads the config itself -- this "
+            "flag is used here only to resolve the daemon's shared-secret auth "
+            "token file, which lives alongside josu.toml."
         ),
     )
     delegate_parser.add_argument(
@@ -634,8 +633,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser(
         "run",
         help=(
-            "Run a task end-to-end through the hosted orchestrator loop "
-            "(U13): worktree -> snapshot -> MCP manifest -> circuit-breaker"
+            "Run a task end-to-end through the hosted orchestrator loop: "
+            "worktree -> snapshot -> MCP manifest -> circuit-breaker"
             "-wrapped adapter invocation -> diff review/merge -> reindex. "
             "Requires the josu daemon already running."
         ),
@@ -651,7 +650,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Path to josu.toml (candidate/chain/orchestrator-adapter config). "
-            "Defaults to the XDG-style location config/__init__.py resolves."
+            "Defaults to ~/.config/josu/josu.toml, or $XDG_CONFIG_HOME/josu/josu.toml "
+            "if set."
         ),
     )
     run_parser.add_argument(
@@ -675,9 +675,9 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_parser = subparsers.add_parser(
         "cleanup",
         help=(
-            "List abandoned josu worktrees -- U7 quota-exhaustion "
-            "abandonments and U8 crash-orphaned worktrees alike -- and "
-            "optionally remove them (U8, R27)"
+            "List abandoned josu worktrees -- quota-exhaustion "
+            "abandonments and crash-orphaned worktrees alike -- and "
+            "optionally remove them"
         ),
     )
     cleanup_parser.add_argument(
