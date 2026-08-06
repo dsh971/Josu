@@ -120,7 +120,7 @@ class OrchestratorAdapterConfig(BaseModel):
         if value not in ALLOWED_OUTPUT_MODES:
             raise ValueError(
                 f"adapter structured_output_mode {value!r} is not a declarable mode "
-                f"(one of {sorted(ALLOWED_OUTPUT_MODES)}) -- rejected at load time (R38) "
+                f"(one of {sorted(ALLOWED_OUTPUT_MODES)}) -- rejected at load time "
                 "rather than accepted and left to fail unpredictably at invocation"
             )
         return value
