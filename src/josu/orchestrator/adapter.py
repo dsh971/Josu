@@ -132,7 +132,7 @@ def _check_mcp_approval_verified(adapter: OrchestratorAdapterConfig) -> None:
     if not adapter.mcp_approval_verified.verified:
         raise McpApprovalNotVerifiedError(
             f"adapter {adapter.name!r}: mcp_approval_verified.verified is not True -- "
-            "refusing to invoke (R37); usable_adapters() is a convenience filter, not "
+            "refusing to invoke; usable_adapters() is a convenience filter, not "
             "an enforcement point, so this is checked again here, immediately before "
             "any subprocess is spawned"
         )
