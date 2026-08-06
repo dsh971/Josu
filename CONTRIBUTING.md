@@ -36,6 +36,7 @@ Scope to one area while iterating, e.g. `uv run python -m pytest tests/graph/ -q
 - **File writes that matter (tokens, MCP manifests) are atomic**, via `os.open(path, os.O_CREAT | os.O_EXCL, 0o600)` (or `O_TRUNC` when overwriting-in-place is intended) rather than write-then-chmod, closing the TOCTOU window where a file briefly exists with default permissions.
 - **A degraded dependency (an unreachable graph engine, a daemon that's slow to respond) reports itself distinctly rather than crashing the caller** — see `GraphEngineUnavailableError`'s `reason` field and `ReindexResult.engine_error`. Prefer that shape over a bare exception when adding a new best-effort integration point.
 - Match the existing per-package structure under `src/josu/` (`config/`, `delegate/`, `graph/`, `orchestrator/`, `proactive/`, `fallback/`, `observability/`, `models/`) — a new concern usually belongs inside one of these, not at the top level.
+- **User-facing CLI help/error text never references internal plan-doc IDs (`U#`/`R#`) or internal file/module paths.** `cli.py`'s `argparse` `help=` strings are the surface to check — a reader outside this repo's own planning docs has no way to make sense of `(U13)` or a pointer to `config/__init__.py`; describe the actual behavior or value instead. Docstrings and comments may reference IDs for maintainers (see the docstring-content convention above) — this rule is specifically about text an end user sees.
 
 ## Commit messages
 
