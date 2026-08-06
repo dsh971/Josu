@@ -1,24 +1,26 @@
-"""Tests for `cli.py`'s `_cmd_run` (`josu run`) -- specifically its
-exception-handling boundary (Tier 2 review fix for U13/U14).
+"""Tests for `cli.py`'s `_cmd_run` (`josu run`) -- its exception-handling
+boundary (Tier 2 review fix for U13/U14) and its config-warning-printing
+behavior (feat/cli-ease-of-use plan, U4).
 
-Before this fix, `_cmd_run` only caught `DaemonNotReachableError` and
-`NoUsableAdapterError` around its `run_task()` call -- any other exception
-`run_task()` could raise (e.g. `MCPServerConnectionError` if the daemon
-crashes mid-run, `GitAllowlistViolationError`, `ConfigPathStagedError`)
-propagated uncaught all the way to `main()`, producing a raw Python
-traceback instead of this file's standard clean `josu run: <message>`
-shape every other subcommand uses on failure.
+Before the exception-handling fix, `_cmd_run` only caught
+`DaemonNotReachableError` and `NoUsableAdapterError` around its
+`run_task()` call -- any other exception `run_task()` could raise (e.g.
+`MCPServerConnectionError` if the daemon crashes mid-run,
+`GitAllowlistViolationError`, `ConfigPathStagedError`) propagated uncaught
+all the way to `main()`, producing a raw Python traceback instead of this
+file's standard clean `josu run: <message>` shape every other subcommand
+uses on failure.
 
 `run_task()` itself is monkeypatched at its lazy-import source
 (`josu.orchestrator.run.run_task`, imported inside `_cmd_run`'s own body at
-call time) -- this test's only concern is `_cmd_run`'s own exception
-handling, not `run_task()`'s internals (already covered by
-`tests/orchestrator/test_run.py`).
+call time) -- these tests' only concern is `_cmd_run`'s own behavior, not
+`run_task()`'s internals (already covered by `tests/orchestrator/test_run.py`).
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import threading
 from contextlib import closing
@@ -134,3 +136,41 @@ def test_generic_exception_from_run_task_is_not_confused_with_the_specific_handl
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "josu daemon not reachable" in captured.out
+
+
+def test_cmd_run_prints_config_permission_warning(tmp_path, fake_daemon, monkeypatch, capsys):
+    """feat/cli-ease-of-use plan (U4): `_cmd_run` loads config in-process
+    (unlike `_cmd_delegate`, which never does -- see
+    `test_cmd_delegate_prints_no_config_warning_even_when_misconfigured`
+    below) and must surface `config.warnings` the same way the daemon
+    does. Uses this file's own `fake_daemon` real-TCP-listener fixture for
+    the reachability check, matching this repo's "prefer a real fixture
+    server over mocking the transport layer" testing convention, rather
+    than monkeypatching `check_daemon_reachable` directly."""
+    import josu.orchestrator.run as run_module
+    from josu.cli import _cmd_run
+
+    def _fake_run_task(*args, **kwargs):
+        raise RuntimeError("stub: run_task should not be reached by this warning-only test")
+
+    monkeypatch.setattr(run_module, "run_task", _fake_run_task)
+
+    config_path = tmp_path / "josu.toml"
+    config_path.write_text(
+        "[[delegate.candidates]]\n"
+        'name = "local-ollama"\n'
+        'endpoint = "http://localhost:11434/v1"\n'
+        "local = true\n"
+        'model = "qwen2.5-coder:7b"\n',
+        encoding="utf-8",
+    )
+    os.chmod(config_path, 0o644)
+
+    host, port = fake_daemon
+    args = _run_args(host=host, port=port, config_path=config_path)
+
+    _cmd_run(args)
+
+    out = capsys.readouterr().out
+    assert "josu run: warning:" in out
+    assert "group/world-accessible" in out
