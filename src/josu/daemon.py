@@ -111,6 +111,13 @@ def create_app(
     if config is None:
         config = load_config(config_path)
 
+    # Surface config warnings (e.g. a group/world-readable josu.toml) at
+    # startup instead of silently discarding them -- `load_config()`
+    # computes these but nothing previously read `config.warnings` anywhere
+    # in this codebase.
+    for warning in config.warnings:
+        print(f"josu daemon: warning: {warning}")
+
     # Resolve the token path from `config.path` itself, not the separate
     # `config_path` parameter -- a caller passing a pre-built `config`
     # object directly (as this function's own docstring says is supported,

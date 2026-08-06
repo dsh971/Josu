@@ -1,14 +1,15 @@
-"""Tests for the `josu` CLI's argparse surface (`src/josu/cli.py`) --
-specifically `--help` text quality, per docs/plans/2026-08-06-001-fix-cli-
-ease-of-use-plan.md (origin: docs/brainstorms/2026-08-05-cli-ease-of-use-
-requirements.md): user-facing help text must not leak internal plan/
-requirement IDs or internal module paths, and must reflect real, current
-values rather than pointing at source.
+"""Tests for the `josu` CLI's argparse surface and `_cmd_run` (`src/josu/
+cli.py`), per docs/plans/2026-08-06-001-fix-cli-ease-of-use-plan.md (origin:
+docs/brainstorms/2026-08-05-cli-ease-of-use-requirements.md): user-facing
+help text must not leak internal plan/requirement IDs or internal module
+paths and must reflect real, current values rather than pointing at source;
+`josu run`'s config-permission warnings must reach the console.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 
 from josu.cli import build_parser
@@ -78,3 +79,39 @@ def test_config_help_consistent_and_no_internal_module_reference():
         assert "~/.config/josu/josu.toml" in help_text
         assert "$XDG_CONFIG_HOME/josu/josu.toml" in help_text
         assert "config/__init__.py" not in help_text
+
+
+def test_cmd_run_prints_config_permission_warning(tmp_path, monkeypatch, capsys):
+    """U4: `_cmd_run` loads config in-process (unlike `_cmd_delegate`, which
+    never does) and must surface `config.warnings` the same way the daemon
+    does. `check_daemon_reachable` and `run_task` are stubbed -- this test
+    isolates the CLI-layer warning-print behavior from the full orchestrator
+    loop (worktree/adapter/diff-review), which has its own coverage in
+    `tests/orchestrator/test_run.py`."""
+    monkeypatch.setattr(
+        "josu.delegate.daemon_client.check_daemon_reachable", lambda host, port: None
+    )
+
+    def _fake_run_task(*args, **kwargs):
+        raise RuntimeError("stub: run_task should not be reached by this warning-only test")
+
+    monkeypatch.setattr("josu.orchestrator.run.run_task", _fake_run_task)
+
+    config_path = tmp_path / "josu.toml"
+    config_path.write_text(
+        "[[delegate.candidates]]\n"
+        'name = "local-ollama"\n'
+        'endpoint = "http://localhost:11434/v1"\n'
+        "local = true\n"
+        'model = "qwen2.5-coder:7b"\n',
+        encoding="utf-8",
+    )
+    os.chmod(config_path, 0o644)
+
+    parser = build_parser()
+    args = parser.parse_args(["run", "do something", "--config", str(config_path)])
+    args.func(args)
+
+    out = capsys.readouterr().out
+    assert "josu run: warning:" in out
+    assert "group/world-accessible" in out

@@ -428,6 +428,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     repo_root = Path(args.repo_root) if args.repo_root else Path.cwd()
     config_path = Path(args.config) if args.config else resolve_config_path()
     config = load_config(config_path)
+    for warning in config.warnings:
+        print(f"josu run: warning: {warning}")
 
     try:
         result = run_task(

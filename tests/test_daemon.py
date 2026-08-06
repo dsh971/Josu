@@ -194,6 +194,33 @@ def test_create_app_constructs_gortex_engine_without_blocking_on_full_index(
     assert app is not None
 
 
+def test_create_app_prints_no_warning_for_a_correctly_permissioned_config(
+    tmp_path, fixture_repo, fixture_config_path, fake_gortex_server, capsys
+):
+    """U4 (feat/cli-ease-of-use plan): a `josu.toml` with correct (0o600)
+    permissions and no other warnings produces no warning output."""
+    create_app(target=fixture_repo, config_path=fixture_config_path, gortex_process=fake_gortex_server)
+    assert "warning:" not in capsys.readouterr().out
+
+
+def test_create_app_prints_permission_warning_for_a_group_world_readable_config(
+    tmp_path, fixture_repo, fake_gortex_server, capsys
+):
+    """U4: `config.warnings` (e.g. the group/world-readable permission
+    warning) previously had no code path reading it anywhere -- this
+    confirms it now actually reaches stdout at daemon startup, not just
+    that `create_app()`'s return value is unaffected."""
+    config_path = tmp_path / "josu.toml"
+    _write_fixture_josu_toml(config_path)
+    os.chmod(config_path, 0o644)
+
+    create_app(target=fixture_repo, config_path=config_path, gortex_process=fake_gortex_server)
+
+    out = capsys.readouterr().out
+    assert "josu daemon: warning:" in out
+    assert "group/world-accessible" in out
+
+
 def test_create_app_terminates_a_process_it_spawned_if_construction_fails_after(
     tmp_path, fixture_repo, fixture_config_path, monkeypatch
 ):
