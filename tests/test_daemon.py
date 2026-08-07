@@ -194,6 +194,35 @@ def test_create_app_constructs_gortex_engine_without_blocking_on_full_index(
     assert app is not None
 
 
+def test_create_app_prints_no_warning_for_a_correctly_permissioned_config(
+    tmp_path, fixture_repo, fixture_config_path, fake_gortex_server, capsys
+):
+    """U4 (feat/cli-ease-of-use plan): a `josu.toml` with correct (0o600)
+    permissions and no other warnings produces no warning output."""
+    create_app(
+        target=fixture_repo, config_path=fixture_config_path, gortex_process=fake_gortex_server
+    )
+    assert "warning:" not in capsys.readouterr().out
+
+
+def test_create_app_prints_permission_warning_for_a_group_world_readable_config(
+    tmp_path, fixture_repo, fake_gortex_server, capsys
+):
+    """U4: `config.warnings` (e.g. the group/world-readable permission
+    warning) previously had no code path reading it anywhere -- this
+    confirms it now actually reaches stdout at daemon startup, not just
+    that `create_app()`'s return value is unaffected."""
+    config_path = tmp_path / "josu.toml"
+    _write_fixture_josu_toml(config_path)
+    os.chmod(config_path, 0o644)
+
+    create_app(target=fixture_repo, config_path=config_path, gortex_process=fake_gortex_server)
+
+    out = capsys.readouterr().out
+    assert "josu daemon: warning:" in out
+    assert "group/world-accessible" in out
+
+
 def test_create_app_terminates_a_process_it_spawned_if_construction_fails_after(
     tmp_path, fixture_repo, fixture_config_path, monkeypatch
 ):
@@ -438,6 +467,46 @@ def test_josu_delegate_cli_routes_through_the_running_daemon_over_real_http(
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "pong" in captured.out.lower()
+
+
+def test_cmd_delegate_prints_no_config_warning_even_when_misconfigured(
+    tmp_path, fixture_repo, fake_gortex_server, capsys
+):
+    """feat/cli-ease-of-use plan (U4): `_cmd_delegate` deliberately never
+    loads config in-process (it only resolves `config_path` to find the
+    daemon's shared-secret token file, per `_cmd_delegate`'s own docstring)
+    -- so it must never print a `config.warnings` entry itself, even
+    against a misconfigured (group/world-readable) `josu.toml`, unlike
+    `_cmd_run`/`create_app()`. The daemon's own startup warning (from
+    `create_app()`, sharing this test's stdout since the daemon runs
+    in-process on a background thread) is drained before the delegate call
+    so only `_cmd_delegate`'s own output is asserted against."""
+    import argparse
+
+    from josu.cli import _cmd_delegate
+
+    config_path = tmp_path / "josu.toml"
+    _write_fixture_josu_toml(config_path)
+    os.chmod(config_path, 0o644)
+
+    app = create_app(
+        target=fixture_repo, config_path=config_path, gortex_process=fake_gortex_server
+    )
+    capsys.readouterr()  # drain create_app()'s own startup warning print
+
+    with _daemon_thread(app, DEFAULT_HOST, DEFAULT_PORT):
+        args = argparse.Namespace(
+            task_type="file_summarization",
+            task="Reply with the single word: pong. No punctuation.",
+            config=str(config_path),
+            host=None,
+            port=None,
+        )
+        exit_code = _cmd_delegate(args)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "warning:" not in captured.out
 
 
 def test_commit_hook_r39_survives_the_daemon_route_even_with_allow_remote_true_and_remote_ranked_first(

@@ -672,7 +672,7 @@ def test_no_usable_adapter_configured_raises_a_clear_actionable_error(
         orchestrator=OrchestratorConfig(adapters=[]),
     )
 
-    with pytest.raises(NoUsableAdapterError):
+    with pytest.raises(NoUsableAdapterError) as exc_info:
         run_task(
             "a task with nothing configured to run it",
             config=empty_config,
@@ -683,6 +683,9 @@ def test_no_usable_adapter_configured_raises_a_clear_actionable_error(
             host=host,
             port=port,
         )
+    # feat/cli-ease-of-use plan: this user-facing error message must not
+    # leak an internal plan/requirement-ID reference.
+    assert "R37" not in str(exc_info.value)
 
 
 # --- an unexpected exception still saves a record, now WITH diagnostic detail -

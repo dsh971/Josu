@@ -26,6 +26,8 @@ import os
 
 from pydantic import BaseModel, ValidationError
 
+from josu.config._validation import safe_validation_error_detail
+
 
 class DelegateCandidate(BaseModel):
     """One `[[delegate.candidates]]` TOML table."""
@@ -71,7 +73,8 @@ def load_delegate_config(data: dict) -> tuple[DelegateConfig, list[str]]:
             candidate = DelegateCandidate.model_validate(entry)
         except ValidationError as exc:
             warnings.append(
-                f"delegate candidate {entry_name!r} rejected at load time: {exc}"
+                f"delegate candidate {entry_name!r} rejected at load time: "
+                f"{safe_validation_error_detail(exc)}"
             )
             continue
         candidates.append(candidate)

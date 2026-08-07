@@ -249,6 +249,10 @@ mcp_approval_verified = { verified = true, verified_date = 2026-01-01 }
     assert config.adapters == []
     assert len(warnings) == 1
     assert "claude-code-freeform" in warnings[0]
+    # feat/cli-ease-of-use plan (U5): this warning reaches the console now
+    # that config warnings are surfaced -- it must not leak the internal
+    # "(R38)" requirement-ID reference that used to be invisible.
+    assert "R38" not in warnings[0]
 
 
 def test_missing_structured_output_mode_rejected_at_load_time(tmp_path):

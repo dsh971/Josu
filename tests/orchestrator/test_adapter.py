@@ -193,8 +193,11 @@ def test_invoke_adapter_refuses_invocation_when_mcp_approval_not_verified(tmp_pa
     adapter = _adapter(
         mcp_approval_verified=McpApprovalVerified(verified=False, verified_date=date(2026, 1, 1))
     )
-    with pytest.raises(McpApprovalNotVerifiedError):
+    with pytest.raises(McpApprovalNotVerifiedError) as exc_info:
         invoke_adapter(adapter, worktree=tmp_path, mcp_config=tmp_path / "m.json", task="task")
+    # feat/cli-ease-of-use plan: this user-facing error message must not
+    # leak an internal plan/requirement-ID reference.
+    assert "R37" not in str(exc_info.value)
 
 
 # --- Subprocess environment scrubbing (R31-adjacent) -------------------------
