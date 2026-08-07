@@ -65,6 +65,8 @@ field_mapping = { result = "result" }
 mcp_approval_verified = { verified = true, verified_date = 2026-01-01 }
 ```
 
+If a local candidate's context starts feeling tight, [Headroom](https://github.com/headroomlabs-ai/headroom) is worth trying — an external, optional tool (not a josu dependency) that compresses tool output and context before it reaches a model. Point a candidate's `endpoint` above at a Headroom proxy sitting in front of its own model server instead of the model server directly; Headroom's own docs describe this against Ollama's endpoint specifically, though josu's maintainers haven't verified it end-to-end or checked how well its compression holds up for small local models. It can also wrap the hosted CLI directly (`headroom wrap claude`) to cut Claude Code's own token cost — a separate use case from the local-candidate one above.
+
 `josu.toml` should be readable by your user only (`chmod 600`) — it may reference credential env-var names for remote candidates, and josu warns (or refuses, in strict mode) if it's group/world-readable. See `src/josu/CLAUDE.md.template` for the fuller delegation-guide prose worth adapting into your own project's `CLAUDE.md`, and `docs/plans/` for every `[[...]]` field's full schema and rationale.
 
 ### Run it
