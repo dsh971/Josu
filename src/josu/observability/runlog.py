@@ -237,18 +237,23 @@ class RunRecord:
 
     # U13: the composed orchestrator loop's own bookkeeping -- which of the
     # plan's Test scenarios this run landed in (`RUN_OUTCOME_*` above), plus
-    # enough merge/reindex detail that `josu log` can explain a run "spanning
-    # worktree creation through merge and reindex ... with no code reading
-    # required" (U13 Verification) without a caller having to infer any of
-    # it from which of the events above happen to be present. `outcome` is
-    # `None` only if a run never reached `record_outcome()` at all (an
-    # old-format record predating U13, or an exception raised before
-    # `run_task()`'s own `finally` block runs).
+    # enough merge detail that `josu log` can explain a run "spanning
+    # worktree creation through merge ... with no code reading required"
+    # (U13 Verification) without a caller having to infer any of it from
+    # which of the events above happen to be present. `outcome` is `None`
+    # only if a run never reached `record_outcome()` at all (an old-format
+    # record predating U13, or an exception raised before `run_task()`'s
+    # own `finally` block runs).
+    #
+    # `reindexed_files`/`pruned_files` (present in records saved before the
+    # gortex integration rework) are no longer written -- a configured
+    # gortex's own watcher owns reindexing invisibly to josu now, so there
+    # is nothing meaningful left to report per-run. `from_dict()` below
+    # simply ignores those keys on an old on-disk record rather than
+    # erroring.
     outcome: str | None = None
     worktree_path: str | None = None
     diverged_paths: list[str] = field(default_factory=list)
-    reindexed_files: list[str] = field(default_factory=list)
-    pruned_files: list[str] = field(default_factory=list)
 
     # P1 fix: `RUN_OUTCOME_ERROR` previously carried no diagnostic detail at
     # all -- `josu log <run_id>` showed only `outcome: error`, useless for
@@ -280,27 +285,22 @@ class RunRecord:
         *,
         worktree_path: str | None = None,
         diverged_paths: Sequence[str] = (),
-        reindexed_files: Sequence[str] = (),
-        pruned_files: Sequence[str] = (),
         error_class: str | None = None,
         error_message: str | None = None,
     ) -> None:
         """U13: record the run's overall outcome (one of `RUN_OUTCOME_*`)
-        plus whatever merge/reindex detail is relevant to it. Called exactly
-        once, from `orchestrator/run.py`'s `run_task()` `finally` block, so
-        it always runs regardless of how the run concluded.
+        plus whatever merge detail is relevant to it. Called exactly once,
+        from `orchestrator/run.py`'s `run_task()` `finally` block, so it
+        always runs regardless of how the run concluded.
 
         `error_class`/`error_message` (P1 fix) are only ever populated by a
         caller when `outcome == RUN_OUTCOME_ERROR` -- for every other
         outcome they're left `None`, since the outcome-specific fields
-        (`diverged_paths`, `reindexed_files`, ...) already cover those
-        cases."""
+        (`diverged_paths`, ...) already cover those cases."""
         self.outcome = outcome
         if worktree_path is not None:
             self.worktree_path = worktree_path
         self.diverged_paths = list(diverged_paths)
-        self.reindexed_files = list(reindexed_files)
-        self.pruned_files = list(pruned_files)
         self.error_class = error_class
         self.error_message = _truncate(error_message) if error_message is not None else None
 
@@ -327,8 +327,6 @@ class RunRecord:
             outcome=data.get("outcome"),
             worktree_path=data.get("worktree_path"),
             diverged_paths=list(data.get("diverged_paths", [])),
-            reindexed_files=list(data.get("reindexed_files", [])),
-            pruned_files=list(data.get("pruned_files", [])),
             error_class=data.get("error_class"),
             error_message=data.get("error_message"),
         )
@@ -426,10 +424,6 @@ def render_run(record: RunRecord) -> str:
             lines.append(f"    worktree: {record.worktree_path}")
         if record.diverged_paths:
             lines.append(f"    diverged paths: {', '.join(record.diverged_paths)}")
-        if record.reindexed_files:
-            lines.append(f"    reindexed: {', '.join(record.reindexed_files)}")
-        if record.pruned_files:
-            lines.append(f"    pruned: {', '.join(record.pruned_files)}")
         if record.error_class or record.error_message:
             lines.append(f"    error: {record.error_class}: {record.error_message}")
 

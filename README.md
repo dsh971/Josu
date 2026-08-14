@@ -14,7 +14,7 @@ Neither model re-derives context from scratch to do this. Both query a shared, i
 
 - **A hosted CLI agent drives, via a config-driven adapter — not hardcoded to one vendor.** Tasks run in an isolated git worktree, unattended but never with a full permission bypass — work lands as a diff for review before merging. Claude Code is the only adapter that ships today (its headless mode supports non-interactive MCP tool approval); Codex is the natural next candidate but is blocked on an external, currently-open upstream issue ([openai/codex#24135](https://github.com/openai/codex/issues/24135)) with no non-interactive MCP-approval path short of disabling its sandbox — not a limitation josu's own architecture imposes. Adding a new adapter is meant to be a declarative config entry (invocation command + structured-output field mapping), not a hand-written integration, for any CLI that clears the same non-interactive-approval bar.
 - **Bounded sub-tasks get delegated.** A static, developer-overridable guide decides what's safe to hand off; a ranked fallback chain (free/local candidates first) picks who actually does it.
-- **Both sides share one context graph.** Backed by [gortex](https://github.com/zzet/gortex), queried through a fixed two-tool MCP surface so the schema footprint never grows with the graph.
+- **Both sides share one context graph.** josu never installs or manages the graph engine itself — it's a config-declared connection target you point josu at, the same way you already run the hosted CLI agent yourself. [gortex](https://github.com/zzet/gortex) is the default/reference target; queried through a fixed two-tool MCP surface so the schema footprint never grows with the graph. No target configured or reachable degrades gracefully to direct file exploration, not a hard failure.
 - **Nothing runs unattended without a safety net.** Wall-clock timeouts, per-call timeouts, a local run log, and a hard rule against `--dangerously-skip-permissions`-style bypasses.
 
 ## Getting started
@@ -23,7 +23,7 @@ Neither model re-derives context from scratch to do this. Both query a shared, i
 
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/)
 - A hosted CLI agent on `PATH` for `josu run` to drive as a subprocess — currently only the [`claude`](https://claude.com/product/claude-code) CLI (see the `[[orchestrator.adapters]]` allowlist below); not needed just to run the daemon or the `delegate` CLI escape hatch
-- The [`gortex`](https://github.com/zzet/gortex) CLI on `PATH` — powers the shared code-relationship graph. Install it with `curl -fsSL https://get.gortex.dev | sh` or see its own [installation docs](https://github.com/zzet/gortex#installation)
+- [`gortex`](https://github.com/zzet/gortex), running and tracking your repo — the default/reference context-graph target. Install it (`curl -fsSL https://get.gortex.dev | sh` or see its own [installation docs](https://github.com/zzet/gortex#installation)), then start and track your repo yourself: `gortex daemon start --http-addr 127.0.0.1:7411 --tools facade-v1 --detach && gortex track /path/to/your/repo --wait`. josu never installs, starts, or tracks gortex on your behalf — declare the connection in `josu.toml` (see Configure below). Skipping this entirely is fine too: josu falls back to direct file exploration with no graph engine configured.
 - An OpenAI-chat-compatible local server for the delegate worker (e.g. [Ollama](https://ollama.com) serving its `/v1` endpoint) — only needed once you configure at least one local delegate candidate
 
 ### Install
@@ -53,6 +53,11 @@ model = "qwen2.5-coder:7b"              # the only curated model in v1 (see src/
 task_type = "file_summarization"
 candidates = ["local-qwen"]
 
+[[graph.engines]]                        # optional -- omit entirely to run with no graph engine
+name = "gortex"
+host = "127.0.0.1"
+port = 7411                              # must match the --http-addr port you started gortex with
+
 [orchestrator]
 wall_clock_timeout_seconds = 1200        # whole-run budget for `josu run`, defaults to 20 minutes
 
@@ -70,14 +75,14 @@ mcp_approval_verified = { verified = true, verified_date = 2026-01-01 }
 ### Run it
 
 ```bash
-# 1. Start the daemon (spawns/reuses gortex, serves both MCP servers + internal routes)
+# 1. Start the daemon (connects to your configured graph-engine target, if any; serves both MCP servers + internal routes)
 uv run josu daemon start --target /path/to/your/repo
 
 # 2. In your repo, install the post-commit hook that drives proactive checks
 cd /path/to/your/repo
 uv run josu init
 
-# 3. Hand a task to the hosted orchestrator loop (worktree -> adapter -> diff review -> merge -> reindex)
+# 3. Hand a task to the hosted orchestrator loop (worktree -> adapter -> diff review -> merge)
 uv run josu run "Add input validation to the signup form"
 ```
 

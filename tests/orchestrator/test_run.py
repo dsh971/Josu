@@ -5,12 +5,11 @@ Real `git` subprocess calls throughout (via the `git_repo` fixture from
 daemon-reachability check -- no mocking of `worktree.py`/`merge.py`/
 `circuit_breaker.py`/`mcp_manifest.py`/`graph/index.py` internals, all of
 which are already independently tested elsewhere. `run_task()` no longer
-takes a graph engine directly (doc-review fix): reindexing is routed
-through the daemon's `/graph/internal/reindex` route
-(`graph/internal_api.py`), so `fake_daemon` below is enough for tests that
-don't care about reindex correctness; the one test that does
-(`test_successful_merge_triggers_exactly_the_changed_path_reindex`) uses a
-real daemon against a fixture gortex HTTP server instead.
+takes a graph engine directly, and no longer triggers reindexing at all on
+merge (R4/R5) -- a configured gortex's own watcher is the sole reindex
+trigger now, so `fake_daemon` below is enough for every test; see
+`test_successful_merge_does_not_trigger_any_reindex_call` for the
+merge-no-longer-reindexes assertion.
 
 The one boundary faked here is the adapter invocation itself
 (`adapters.claude_code.run()`'s call shape): `run_task()` accepts an
@@ -445,42 +444,27 @@ def test_hang_during_worktree_creation_is_caught_by_the_circuit_breaker(
     assert len(loaded.circuit_breaker_events) == 1
 
 
-# --- successful merge triggers exactly the changed-path reindex (R14) -------
+# --- a successful merge no longer triggers josu's own reindex (R4) ---------
 
 
-def test_successful_merge_triggers_exactly_the_changed_path_reindex(
-    git_repo, tmp_path, config
-):
-    """Covers the plan's fourth U13 test scenario: a successful merge
-    triggers exactly the changed-path reindex, not a full rebuild.
-
-    Uses a real running daemon (against a fixture gortex HTTP server, not
-    `fake_daemon`'s inert TCP listener) so the assertion can inspect what
-    `/graph/internal/reindex` actually received -- proving the reindex call
-    reaches the daemon's live engine with exactly the changed-file list,
-    not a full-tree rescan or a throwaway engine nothing else can see."""
-    import json as json_module
+def test_successful_merge_does_not_trigger_any_reindex_call(git_repo, tmp_path, config):
+    """A configured gortex's own watcher is the sole reindex trigger now
+    (R4) -- `run_task()` no longer calls into a reindex path on a
+    successful merge at all. Uses a real running daemon (against a
+    fixture gortex HTTP server) so the assertion can inspect that NO
+    `/v1/tools/*` call ever reaches it as a side effect of the merge --
+    proving the retirement, not just the absence of a return value."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     from josu.daemon import create_app
     from josu.graph.gortex_process import GortexProcess
 
-    (git_repo / "unrelated.py").write_text(
-        "def unrelated_function():\n    return 'untouched'\n", encoding="utf-8"
-    )
-    subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "add unrelated.py"], cwd=git_repo, check=True)
-
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-    received_reindex_calls: list[dict] = []
+    received_calls: list[str] = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
-            length = int(self.headers.get("Content-Length", "0"))
-            body = json_module.loads(self.rfile.read(length)) if length else {}
-            if self.path == "/v1/tools/reindex_repository":
-                received_reindex_calls.append(body)
-            payload = json_module.dumps({"status": "ok"}).encode("utf-8")
+            received_calls.append(self.path)
+            payload = b'{"status": "ok"}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -493,9 +477,7 @@ def test_successful_merge_triggers_exactly_the_changed_path_reindex(
     gortex_httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     gortex_thread = threading.Thread(target=gortex_httpd.serve_forever, daemon=True)
     gortex_thread.start()
-    fake_gortex_process = GortexProcess(
-        host="127.0.0.1", port=gortex_httpd.server_port, popen=None
-    )
+    fake_gortex_process = GortexProcess(host="127.0.0.1", port=gortex_httpd.server_port)
 
     app = create_app(target=git_repo, config=config, gortex_process=fake_gortex_process)
 
@@ -526,19 +508,8 @@ def test_successful_merge_triggers_exactly_the_changed_path_reindex(
         gortex_thread.join()
 
     assert result.outcome == RUN_OUTCOME_MERGED
-    assert result.reindex_result is not None
-    reindexed = [Path(p).name for p in result.reindex_result.reindexed_files]
-    assert reindexed == ["new_module.py"]
-    assert result.reindex_result.engine_error is None
-
-    # The daemon's live engine received exactly the changed-path reindex --
-    # not unrelated.py, not README.md, not a full rebuild.
-    assert len(received_reindex_calls) == 1
-    reindexed_paths = [Path(p).name for p in received_reindex_calls[0]["paths"]]
-    assert reindexed_paths == ["new_module.py"]
-
-    loaded = load_run(result.run_id, tmp_path / "runlog")
-    assert loaded.reindexed_files == result.reindex_result.reindexed_files
+    assert not hasattr(result, "reindex_result")
+    assert received_calls == []
 
 
 # --- R21: snapshot timing -- concurrent edit made WHILE the adapter runs ----
