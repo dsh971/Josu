@@ -40,6 +40,7 @@ from collections.abc import Mapping, Sequence
 
 from pydantic import BaseModel, ValidationError
 
+from josu.config._validation import safe_validation_error_detail
 from josu.config.delegate import DelegateCandidate
 
 # --- Starting v1 task-type categories (origin doc's delegation guide, R5) ---
@@ -152,7 +153,8 @@ def load_chains_config(data: dict) -> tuple[ChainsConfig, list[str]]:
             chain = DelegationChain.model_validate(entry)
         except ValidationError as exc:
             warnings.append(
-                f"delegation chain {entry_task_type!r} rejected at load time: {exc}"
+                f"delegation chain {entry_task_type!r} rejected at load time: "
+                f"{safe_validation_error_detail(exc)}"
             )
             continue
 

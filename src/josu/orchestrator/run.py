@@ -127,7 +127,7 @@ class NoUsableAdapterError(RuntimeError):
         super().__init__(
             f"no usable orchestrator adapter named {adapter_name!r} configured -- add an "
             "[[orchestrator.adapters]] entry to josu.toml with mcp_approval_verified.verified "
-            "= true (R37), or check the name against what's configured"
+            "= true, or check the name against what's configured"
         )
 
 

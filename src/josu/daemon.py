@@ -165,8 +165,19 @@ def create_app(
     if config is None:
         config = load_config(config_path)
 
+    # Surface config warnings (e.g. a group/world-readable josu.toml) at
+    # startup instead of silently discarding them -- `load_config()`
+    # computes these but nothing previously read `config.warnings` anywhere
+    # in this codebase. This is `create_app()`'s first `print()` call --
+    # otherwise a pure library function with no stdout side effects, called
+    # directly by several test fixtures. Rejected the alternative of
+    # threading the loaded config back out through `run()` so `cli.py`'s
+    # `_cmd_daemon_start` could print it via this file's own existing
+    # convention: that reshapes both functions' signatures to serve one
+    # print statement. Printing here is the smaller, bounded change (code-
+    # review discussion, feat/cli-ease-of-use plan).
     for warning in config.warnings:
-        print(f"josu: warning: {warning}")
+        print(f"josu daemon: warning: {warning}")
 
     # Resolve the token path from `config.path` itself, not the separate
     # `config_path` parameter -- a caller passing a pre-built `config`
