@@ -215,7 +215,6 @@ def remove_abandoned_worktree(
 
 def _cmd_daemon_start(args: argparse.Namespace) -> int:
     from josu.daemon import run
-    from josu.graph.gortex_process import GortexProcessError
     from josu.orchestrator.worktree import default_worktrees_dir
 
     target = Path(args.target) if args.target else Path.cwd()
@@ -238,15 +237,11 @@ def _cmd_daemon_start(args: argparse.Namespace) -> int:
         f"Starting josu daemon on {args.host}:{args.port} "
         f"(target: {target}, config: {config_path})"
     )
-    # U15: `run()` spawns (or reuses a validated survivor of) the gortex
-    # subprocess before serving -- a missing `gortex` binary, or one that
-    # crashes during startup, surfaces here as a clean, actionable message
-    # rather than a bare traceback.
-    try:
-        run(host=args.host, port=args.port, target=target, config_path=config_path)
-    except GortexProcessError as exc:
-        print(f"josu daemon start: {exc}")
-        return 1
+    # josu never spawns gortex -- `run()` only connects to whatever
+    # `[[graph.engines]]` target is configured, degrading to no graph
+    # engine (never raising) when it's absent, unreachable, or
+    # incompatible. See daemon.py's `_resolve_graph_engine_target()`.
+    run(host=args.host, port=args.port, target=target, config_path=config_path)
     return 0
 
 
@@ -390,7 +385,7 @@ def _prompt_diff_approval(diff: str) -> bool:
 def _cmd_run(args: argparse.Namespace) -> int:
     """U13's `josu run <task>`: the end-to-end orchestrator main loop --
     worktree -> snapshot -> MCP manifest -> circuit-breaker-wrapped adapter
-    invocation -> diff review/merge -> reindex, composed by `orchestrator/
+    invocation -> diff review/merge, composed by `orchestrator/
     run.py`'s `run_task()`. This subcommand is the thin CLI shell around it:
     resolves config/paths, prints the surfaced diff and prompts for
     approval, then reports the outcome.
@@ -461,9 +456,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     print(f"josu run: run {result.run_id} finished (see `josu log {result.run_id}` for details)")
 
     if result.outcome == RUN_OUTCOME_MERGED:
-        reindexed = len(result.reindex_result.reindexed_files) if result.reindex_result else 0
-        pruned = len(result.reindex_result.pruned_files) if result.reindex_result else 0
-        print(f"  merged into {repo_root} -- reindexed {reindexed} file(s), pruned {pruned}")
+        print(f"  merged into {repo_root}")
         return 0
     if result.outcome == RUN_OUTCOME_REJECTED:
         print("  diff rejected -- no changes were merged")
@@ -550,7 +543,11 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--target",
         default=None,
-        help="Project root to build the graph from if none exists yet (default: cwd)",
+        help=(
+            "Repo root scoping graphify file reads and crash-orphaned-worktree "
+            "scanning (default: cwd) -- does not affect the graph engine itself, "
+            "which is a config-declared connection target, not something josu builds"
+        ),
     )
     start_parser.add_argument(
         "--config",
@@ -637,7 +634,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Run a task end-to-end through the hosted orchestrator loop: "
             "worktree -> snapshot -> MCP manifest -> circuit-breaker"
-            "-wrapped adapter invocation -> diff review/merge -> reindex. "
+            "-wrapped adapter invocation -> diff review/merge. "
             "Requires the josu daemon already running."
         ),
     )

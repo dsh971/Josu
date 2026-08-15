@@ -27,21 +27,20 @@ this follows):
    adapter's `run()`, e.g. `adapters.claude_code.run()`).
 5. On success, the diff is surfaced for developer review
    (`merge.diff_for_review()`) and the merge is gated on the caller-supplied
-   `approve()` callback's answer (`merge.merge()`).
-6. On a successful merge, the changed-path reindex
-   (`graph.index.reindex_on_merge()`) -- derives its own changed-path list
-   from the merge result; nothing is passed in from here (R14). The
-   worktree is removed (`worktree.remove_worktree()`) immediately
-   afterward -- AFTER reindexing, never before, since
-   `reindex_on_merge()`'s own diff computation reads from the worktree's
-   working tree via `git`. A developer-rejected diff (no merge to reindex)
-   has its worktree removed right after the rejection is determined,
-   before returning. Both are terminal "nothing more to do with this
-   worktree" states, per the plan's "auto-delete on merge/rejection only"
-   requirement. A circuit-breaker timeout or any other unexpected
-   exception deliberately does NOT remove the worktree -- U8's
-   crash-recovery/cleanup path (`josu cleanup`) is what surfaces and
-   disposes of those, never a silent discard here.
+   `approve()` callback's answer (`merge.merge()`). The worktree is removed
+   (`worktree.remove_worktree()`) immediately after a successful merge, or
+   right after a developer-rejected diff is determined -- both are terminal
+   "nothing more to do with this worktree" states, per the plan's
+   "auto-delete on merge/rejection only" requirement. A circuit-breaker
+   timeout or any other unexpected exception deliberately does NOT remove
+   the worktree -- U8's crash-recovery/cleanup path (`josu cleanup`) is
+   what surfaces and disposes of those, never a silent discard here.
+
+josu's own merge-triggered reindex call was retired (gortex integration
+rework, R4): a configured gortex's own continuous watcher is the sole
+reindex trigger once a repo is tracked, so there is no reindex step here
+anymore -- `run_task()` ends at the merge/rejection worktree cleanup
+described above.
 
 A `RunRecord` (U6) is created up front and saved via `observability.runlog.
 save_run()` in a `finally` block, so success, a developer-rejected diff, a
@@ -56,7 +55,6 @@ for no reason.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,7 +65,6 @@ from josu.config.orchestrator import OrchestratorAdapterConfig, usable_adapters
 from josu.daemon import DEFAULT_HOST, DEFAULT_PORT
 from josu.daemon_auth import resolve_daemon_token
 from josu.delegate.daemon_client import DaemonNotReachableError, check_daemon_reachable
-from josu.graph.index import ReindexError, ReindexResult, reindex_on_merge
 from josu.observability.runlog import (
     RUN_OUTCOME_CIRCUIT_BREAKER_TIMEOUT,
     RUN_OUTCOME_DIVERGED,
@@ -138,10 +135,9 @@ class NoUsableAdapterError(RuntimeError):
 class RunTaskResult:
     """Everything `josu run`'s CLI subcommand (or any other caller) needs to
     report a run's conclusion -- the saved `RunRecord` itself, plus the
-    richer in-process objects (`Worktree`, `MergeResult`, `ReindexResult`)
-    `RunRecord`'s own sanitized/summarized fields don't carry (see
-    `runlog.py`'s module docstring on why records never carry raw
-    payloads)."""
+    richer in-process objects (`Worktree`, `MergeResult`) `RunRecord`'s own
+    sanitized/summarized fields don't carry (see `runlog.py`'s module
+    docstring on why records never carry raw payloads)."""
 
     run_id: str
     record: RunRecord
@@ -149,7 +145,6 @@ class RunTaskResult:
     worktree: Worktree | None = None
     diff: str | None = None
     merge_result: MergeResult | None = None
-    reindex_result: ReindexResult | None = None
     error: Exception | None = None
 
 
@@ -224,7 +219,6 @@ def run_task(
     manifest: MCPManifest | None = None
     diff: str | None = None
     merge_result: MergeResult | None = None
-    reindex_result: ReindexResult | None = None
     outcome = RUN_OUTCOME_ERROR
     error: Exception | None = None
 
@@ -362,43 +356,14 @@ def run_task(
                 merge_result=merge_result,
             )
 
-        # Step 6: on a successful merge, the changed-path reindex -- derives
-        # its own changed-path list from merge_result; nothing passed in
-        # from here (R14). Routed through the daemon's own live engine
-        # (`graph/internal_api.py`'s internal route), never a
-        # process-local throwaway one -- see `graph/index.py`'s module
-        # docstring for the bug this fixes. `run_task()` itself is sync
-        # (the circuit-breaker/adapter-invocation machinery around it is
-        # blocking, not asyncio-based), so this one async call is bridged
-        # via `asyncio.run()` at this single call site rather than making
-        # the whole function async.
-        try:
-            reindex_result = asyncio.run(
-                reindex_on_merge(
-                    worktree,
-                    merge_result,
-                    base_url=f"http://{host}:{port}",
-                    token=daemon_token,
-                )
-            )
-        except ReindexError as exc:
-            # Computing the changed-path set itself failed (e.g. a bounded
-            # git timeout -- see `graph/index.py`'s `_run_git()`). The
-            # merge already succeeded and is not undone for this -- matches
-            # R13's "graph trouble degrades, doesn't block the caller"
-            # posture applied one level up: a reindex failure must not
-            # turn an already-successful merge into a reported run error.
-            reindex_result = ReindexResult(engine_error=str(exc))
         outcome = RUN_OUTCOME_MERGED
-        # Terminal state (merged) -- auto-delete the worktree now, AFTER
-        # reindexing (which still needs to read the worktree's working
-        # tree via git), matching the plan's "auto-delete on
-        # merge/rejection only" requirement (see module docstring).
-        # `force=True`: the worktree always carries uncommitted changes at
-        # this point (the adapter's own edits) -- that's expected, not a
-        # sign anything is wrong, since its diff has already been applied
-        # to `repo_root` by `merge()` above; `git worktree remove` refuses
-        # a dirty worktree without `--force`.
+        # Terminal state (merged) -- auto-delete the worktree now, matching
+        # the plan's "auto-delete on merge/rejection only" requirement (see
+        # module docstring). `force=True`: the worktree always carries
+        # uncommitted changes at this point (the adapter's own edits) --
+        # that's expected, not a sign anything is wrong, since its diff has
+        # already been applied to `repo_root` by `merge()` above; `git
+        # worktree remove` refuses a dirty worktree without `--force`.
         remove_worktree(worktree, force=True)
         return RunTaskResult(
             run_id=record.run_id,
@@ -407,7 +372,6 @@ def run_task(
             worktree=worktree,
             diff=diff,
             merge_result=merge_result,
-            reindex_result=reindex_result,
         )
     except Exception as exc:  # noqa: BLE001 -- deliberately broad: any failure still must save a record
         outcome = RUN_OUTCOME_ERROR
@@ -427,8 +391,6 @@ def run_task(
             outcome,
             worktree_path=str(worktree.path) if worktree is not None else None,
             diverged_paths=list(getattr(error, "diverged_paths", None) or []),
-            reindexed_files=reindex_result.reindexed_files if reindex_result else [],
-            pruned_files=reindex_result.pruned_files if reindex_result else [],
             error_class=type(error).__name__ if is_error_outcome else None,
             error_message=str(error) if is_error_outcome else None,
         )

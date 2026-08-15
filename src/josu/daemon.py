@@ -1,5 +1,5 @@
 """Long-running process hosting the context-graph and delegate MCP servers
-over local HTTP/SSE, plus the gortex subprocess the graph server depends on.
+over local HTTP/SSE.
 
 Not stdio: stdio transport spawns a fresh server process per Claude Code
 session, which would give every worktree its own graph-engine instance and
@@ -8,25 +8,26 @@ exists. Every per-worktree --mcp-config manifest and every direct-call path
 (quota fallback, proactive checks) points at this same running instance.
 See plan Key Technical Decisions.
 
-U15: this daemon also owns the gortex subprocess's lifecycle -- spawning it
-(or reusing a validated survivor from a prior crash) before constructing
-`GortexEngine`, and terminating it on a clean shutdown. Startup blocks on
-gortex's `/healthz` liveness probe only, never on gortex's own initial
-index completing (see `graph/gortex_process.py`'s and the plan's Key
-Technical Decisions) -- there is deliberately no `engine.build()` call at
-startup at all: gortex indexes the path it was spawned with (`--index
-<root>`) as part of starting up, so nothing here needs to separately kick
-off a build the way the graphify-era `GraphifyEngine.build()` precondition
-did.
+josu never installs, spawns, or owns a graph-engine process -- it connects
+to whatever `[[graph.engines]]` target `josu.toml` declares (see
+`config/graph_engines.py`), the same way it already treats the hosted CLI
+agent it drives as a user-installed prerequisite, not something it manages
+itself. `_resolve_graph_engine_target()` below reads that config and checks
+reachability; an absent or unreachable target degrades to no graph engine
+for the session rather than blocking startup (R1/R7) -- `RoutingEngine`
+(`graph/router.py`) is what turns that "no engine" state into the same
+`GraphEngineUnavailableError` an unreachable engine would raise, so
+existing fallback handling doesn't need to know why the engine is missing.
+There is no daemon-owned process lifecycle left to tear down on shutdown.
 
-Every route (graph/delegate SSE, both internal POST endpoints) requires the
-daemon's shared-secret token (`daemon_auth.py`) -- loopback binding alone
-authenticates nothing.
+Every route (graph/delegate SSE, the one remaining internal POST endpoint)
+requires the daemon's shared-secret token (`daemon_auth.py`) -- loopback
+binding alone authenticates nothing.
 """
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import os
 from pathlib import Path
 
 import uvicorn
@@ -47,31 +48,73 @@ from josu.delegate.queue import DelegateQueue
 from josu.delegate.server import build_server as build_delegate_server
 from josu.graph.gortex import GortexEngine
 from josu.graph.gortex_process import (
-    DEFAULT_GORTEX_HOST,
-    DEFAULT_GORTEX_PORT,
     GortexProcess,
     check_gortex_reachable,
-    spawn_gortex,
-    terminate_gortex,
+    check_gortex_tool_surface_capable,
+    check_gortex_version_compatible,
 )
-from josu.graph.internal_api import build_graph_internal_route
+from josu.graph.router import RoutingEngine
 from josu.graph.server import build_server as build_graph_server
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
 
-def _ensure_gortex_running(
-    target: Path, *, gortex_host: str, gortex_port: int
-) -> GortexProcess:
-    """Probe the expected gortex port first -- a validated survivor from a
-    prior crash is reused (mirrors `cli.py`'s `scan_for_crash_orphaned_
-    worktrees()` "surface, don't silently resume" precedent); otherwise a
-    fresh subprocess is spawned. Never blindly spawns a second instance on
-    top of one already there."""
-    if check_gortex_reachable(gortex_host, gortex_port):
-        return GortexProcess(host=gortex_host, port=gortex_port, popen=None)
-    return spawn_gortex(target, host=gortex_host, port=gortex_port)
+def _resolve_graph_engine_target(
+    config: JosuConfig, *, quiet: bool = False
+) -> tuple[GortexProcess | None, str | None]:
+    """Read the configured `[[graph.engines]]` target (only the first
+    entry is ever active -- see `config/graph_engines.py`), check
+    reachability, resolve its optional credential, and run the version/
+    tool-surface compatibility guard (R3). Returns `(target, reason)` --
+    never raises -- `target` is `None` when no target is configured, the
+    configured one isn't reachable, or it fails a compatibility check; the
+    caller degrades to no graph engine for the session either way (R1/R7).
+    `reason` is a short machine-stable string naming *why* (`"unconfigured"`,
+    `"unreachable"`, `"version-incompatible"`, `"incapable"`) when `target`
+    is `None`, else `None` -- `RoutingEngine` (`graph/router.py`) threads
+    this into the `GraphEngineUnavailableError` it raises on next use, so
+    an agent driving a graph query sees the real cause instead of one
+    generic "unconfigured" message regardless of which check actually
+    failed. Every degrade condition also prints a `josu daemon: warning:
+    ...` line naming what's wrong, so a misconfigured target is visible to
+    a human watching the daemon's stdout too -- unless `quiet=True` (used
+    by `RoutingEngine`'s lazy reprobe, which calls this every ~30s while no
+    engine is available; printing the same warning on every reprobe would
+    spam the daemon's log for the entire time a target stays down, when
+    the user already saw it once at startup).
+    """
+    engines = config.graph_engines.engines
+    if not engines:
+        return None, "unconfigured"
+    target = engines[0]
+
+    auth_token = os.environ.get(target.api_key_env) if target.api_key_env else None
+
+    if not check_gortex_reachable(target.host, target.port, auth_token=auth_token):
+        if not quiet:
+            print(
+                f"josu daemon: warning: graph engine {target.name!r} at "
+                f"{target.host}:{target.port} is not reachable -- proceeding without a "
+                "graph engine for this session"
+            )
+        return None, "unreachable"
+
+    version_compatible, version_detail = check_gortex_version_compatible(target.host)
+    if version_detail and not quiet:
+        print(f"josu daemon: warning: graph engine {target.name!r}: {version_detail}")
+    if not version_compatible:
+        return None, "version-incompatible"
+
+    tool_surface_capable, capability_detail = check_gortex_tool_surface_capable(
+        target.host, target.port, auth_token=auth_token
+    )
+    if not tool_surface_capable:
+        if not quiet:
+            print(f"josu daemon: warning: graph engine {target.name!r}: {capability_detail}")
+        return None, "incapable"
+
+    return GortexProcess(host=target.host, port=target.port, auth_token=auth_token), None
 
 
 def create_app(
@@ -80,18 +123,29 @@ def create_app(
     config_path: Path | None = None,
     delegate_timeout: float = DEFAULT_TIMEOUT_SECONDS,
     delegate_client_factory=None,
-    gortex_host: str = DEFAULT_GORTEX_HOST,
-    gortex_port: int = DEFAULT_GORTEX_PORT,
     gortex_process: GortexProcess | None = None,
 ) -> Starlette:
     """Build the Starlette ASGI app mounting both MCP servers over SSE, the
-    two internal POST routes, and the auth middleware guarding all of them.
+    one remaining internal POST route, and the auth middleware guarding all
+    of them.
 
-    `gortex_process` (test seam): when given, skips the real
-    probe-then-spawn sequence entirely and uses this handle directly --
-    lets a test construct a daemon against a stub gortex HTTP server
-    without a real `gortex` binary on `PATH`. `None` (the default)
-    preserves real production behavior (`_ensure_gortex_running()`).
+    `target` no longer names a repo gortex is spawned to index -- tracking
+    a repo is entirely the user's own `gortex track` setup step now. It's
+    still consumed here as `RoutingEngine`'s `scope_root`: the boundary a
+    graphify-eligible `execute()` call's path must resolve inside, so the
+    graph MCP surface can't read arbitrary files outside the daemon's own
+    tracked repo (see `graph/router.py`).
+
+    `gortex_process` (test seam): when given, used directly as the
+    resolved graph-engine target instead of resolving one from `config`'s
+    `[[graph.engines]]` section -- lets a test construct a daemon against a
+    stub gortex HTTP server without a real `gortex` binary or a real
+    `josu.toml` entry. `None` (the default) resolves the real target from
+    config via `_resolve_graph_engine_target()`, which may itself be
+    `None` (no target configured or reachable) -- in production, that's
+    not an error; the daemon starts with no graph engine for the session
+    (R1/R7), and `RoutingEngine` (below) is what makes every existing
+    fallback path treat that the same as an unreachable one.
 
     `config` is the already-loaded `josu.toml` contents; if omitted, it's
     loaded here via `config/__init__.py.load_config(config_path)`.
@@ -136,51 +190,53 @@ def create_app(
     token_path = resolve_daemon_token_path(config.path.parent)
     token = load_or_create_daemon_token(token_path)
 
-    # Captured before `gortex_process` is shadowed by `resolved_gortex_
-    # process` below -- a caller-supplied `gortex_process` (the test seam)
-    # is never this daemon instance's to terminate, since it didn't spawn
-    # it. Both the construction-failure `except` below and `lifespan`'s
-    # clean-shutdown teardown gate `terminate_gortex()` on this same flag.
-    owns_gortex_process = gortex_process is None
-    resolved_gortex_process = gortex_process or _ensure_gortex_running(
-        target or Path.cwd(), gortex_host=gortex_host, gortex_port=gortex_port
+    def _build_primary_engine(
+        *, quiet: bool = False
+    ) -> tuple[GortexEngine | None, str | None]:
+        resolved, reason = _resolve_graph_engine_target(config, quiet=quiet)
+        if resolved is None:
+            return None, reason
+        return GortexEngine(resolved.base_url, auth_token=resolved.auth_token), None
+
+    if gortex_process is not None:
+        # Test seam: a fixed stub target -- not re-probed lazily, since
+        # there's no real `_resolve_graph_engine_target()` call behind it.
+        primary_engine: GortexEngine | None = GortexEngine(
+            gortex_process.base_url, auth_token=gortex_process.auth_token
+        )
+        engine = RoutingEngine(primary_engine, scope_root=target)
+    else:
+        primary_engine, degrade_reason = _build_primary_engine()
+        engine = RoutingEngine(
+            primary_engine,
+            primary_factory=lambda: _build_primary_engine(quiet=True),
+            scope_root=target,
+            primary_unavailable_reason=degrade_reason,
+        )
+
+    graph_server = build_graph_server(engine)
+    graph_sse = SseServerTransport("/graph/messages/")
+
+    registry = {candidate.name: candidate for candidate in config.delegate.candidates}
+    delegate_queue = DelegateQueue()
+    delegate_server = build_delegate_server(
+        graph_engine=engine,
+        chains_config=config.chains,
+        registry=registry,
+        timeout=delegate_timeout,
+        queue=delegate_queue,
+        client_factory=delegate_client_factory,
     )
-    # Everything below can raise (a malformed josu.toml surfacing during
-    # chain/registry construction, etc.) -- if it does, `resolved_gortex_
-    # process` was already spawned above but `lifespan`'s teardown never
-    # gets a chance to run (the app is never constructed/served), which
-    # would otherwise leak the child process indefinitely.
-    try:
-        engine = GortexEngine(resolved_gortex_process.base_url)
+    delegate_sse = SseServerTransport("/delegate/messages/")
 
-        graph_server = build_graph_server(engine)
-        graph_sse = SseServerTransport("/graph/messages/")
-
-        registry = {candidate.name: candidate for candidate in config.delegate.candidates}
-        delegate_queue = DelegateQueue()
-        delegate_server = build_delegate_server(
-            graph_engine=engine,
-            chains_config=config.chains,
-            registry=registry,
-            timeout=delegate_timeout,
-            queue=delegate_queue,
-            client_factory=delegate_client_factory,
-        )
-        delegate_sse = SseServerTransport("/delegate/messages/")
-
-        internal_delegate_route = build_delegate_internal_route(
-            queue=delegate_queue,
-            chains_config=config.chains,
-            registry=registry,
-            graph_engine=engine,
-            timeout=delegate_timeout,
-            client_factory=delegate_client_factory,
-        )
-        internal_graph_route = build_graph_internal_route(engine=engine)
-    except Exception:
-        if owns_gortex_process:
-            terminate_gortex(resolved_gortex_process)
-        raise
+    internal_delegate_route = build_delegate_internal_route(
+        queue=delegate_queue,
+        chains_config=config.chains,
+        registry=registry,
+        graph_engine=engine,
+        timeout=delegate_timeout,
+        client_factory=delegate_client_factory,
+    )
 
     async def handle_graph_sse(request):
         async with graph_sse.connect_sse(
@@ -206,22 +262,9 @@ def create_app(
         Route("/delegate/sse", endpoint=handle_delegate_sse, methods=["GET"]),
         Mount("/delegate/messages/", app=delegate_sse.handle_post_message),
         internal_delegate_route,
-        internal_graph_route,
     ]
 
-    @asynccontextmanager
-    async def lifespan(app: Starlette):
-        yield
-        # Clean-shutdown teardown, gated on `owns_gortex_process` (see
-        # above). uvicorn translates SIGINT/SIGTERM into this ASGI lifespan
-        # "shutdown" event; a non-clean exit (`kill -9`, OOM) does not, and
-        # the orphaned gortex process is left for the next `daemon start`'s
-        # reuse/conflict probe -- deliberate, see `gortex_process.py`'s
-        # module docstring.
-        if owns_gortex_process:
-            terminate_gortex(resolved_gortex_process)
-
-    app = Starlette(routes=routes, lifespan=lifespan)
+    app = Starlette(routes=routes)
     return DaemonAuthMiddleware(app, token)
 
 

@@ -21,6 +21,13 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
 ]
+# Excel/Word/Google-Workspace secondary graph engine (feat/gortex-integration-rework
+# U7) -- installed lazily by the user on first need (see graph/router.py), never
+# unconditionally: the bare "graphifyy" dependency this replaces was an unused
+# leftover from the pre-gortex architecture (no code imported it).
+graphify = [
+    "graphifyy[office,google]>=0.9,<0.10",
+]
 
 [project.scripts]
 josu = "josu.cli:main"

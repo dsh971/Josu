@@ -1,7 +1,7 @@
-"""Tests for GortexEngine (U1) -- against a real, locally-bound HTTP server
-fixture standing in for gortex's own `/v1/tools/{name}` endpoint, mirroring
-`tests/delegate/test_client.py`'s fixture-server pattern. No mocking of
-httpx internals.
+"""Tests for GortexEngine (U1, U4) -- against a real, locally-bound HTTP
+server fixture standing in for gortex's own `/v1/tools/{name}` endpoint,
+mirroring `tests/delegate/test_client.py`'s fixture-server pattern. No
+mocking of httpx internals.
 """
 
 from __future__ import annotations
@@ -179,22 +179,21 @@ async def test_oversized_response_treated_as_unavailable_not_fully_buffered(fixt
 
 
 @pytest.mark.asyncio
-async def test_build_calls_index_repository(fixture_server, tmp_path: Path):
+async def test_build_is_a_no_op_and_makes_no_http_call(fixture_server, tmp_path: Path):
+    """`index_repository` returns HTTP 404 against gortex's real, current
+    tool surface -- build() no longer calls it at all; tracking is the
+    user's own `gortex track` setup step now."""
     base_url, set_respond = fixture_server
     calls = []
 
     def respond(handler: BaseHTTPRequestHandler):
         calls.append(handler.path)
-        length = int(handler.headers.get("Content-Length", "0"))
-        body = json.loads(handler.rfile.read(length)) if length else {}
-        calls.append(body)
         _write_json(handler, 200, {"status": "ok"})
 
     set_respond(respond)
     engine = GortexEngine(base_url)
-    await engine.build(tmp_path)
-    assert calls[0] == "/v1/tools/index_repository"
-    assert calls[1]["repo"] == str(tmp_path.resolve())
+    assert await engine.build(tmp_path) is None
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -267,20 +266,49 @@ async def test_execute_allows_safe_operation_names(fixture_server):
 
 
 @pytest.mark.asyncio
-async def test_update_honors_caller_supplied_changed_files(fixture_server, tmp_path: Path):
-    """Unlike graphify's GraphifyEngine.update() (which ignored the
-    caller-supplied list), GortexEngine.update() passes it straight
-    through as gortex's `paths` argument."""
+async def test_update_is_a_no_op_and_makes_no_http_call(fixture_server, tmp_path: Path):
+    """`reindex_repository` also returns HTTP 404 against gortex's real,
+    current tool surface -- reindexing is owned entirely by the user's own
+    gortex daemon's fsnotify watcher now."""
     base_url, set_respond = fixture_server
-    received = {}
+    calls = []
 
     def respond(handler: BaseHTTPRequestHandler):
-        length = int(handler.headers.get("Content-Length", "0"))
-        received.update(json.loads(handler.rfile.read(length)))
+        calls.append(handler.path)
         _write_json(handler, 200, {"status": "ok"})
 
     set_respond(respond)
     engine = GortexEngine(base_url)
     changed = [tmp_path / "a.py", tmp_path / "b.py"]
-    await engine.update(tmp_path, changed)
-    assert set(received["paths"]) == {str(f) for f in changed}
+    assert await engine.update(tmp_path, changed) is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_auth_token_sent_as_bearer_header_when_configured(fixture_server):
+    base_url, set_respond = fixture_server
+    received_auth = []
+
+    def respond(handler: BaseHTTPRequestHandler):
+        received_auth.append(handler.headers.get("Authorization"))
+        _write_json(handler, 200, {"results": []})
+
+    set_respond(respond)
+    engine = GortexEngine(base_url, auth_token="secret-token-value")
+    await engine.search("anything")
+    assert received_auth == ["Bearer secret-token-value"]
+
+
+@pytest.mark.asyncio
+async def test_no_authorization_header_sent_when_auth_token_not_configured(fixture_server):
+    base_url, set_respond = fixture_server
+    received_auth = []
+
+    def respond(handler: BaseHTTPRequestHandler):
+        received_auth.append(handler.headers.get("Authorization"))
+        _write_json(handler, 200, {"results": []})
+
+    set_respond(respond)
+    engine = GortexEngine(base_url)
+    await engine.search("anything")
+    assert received_auth == [None]

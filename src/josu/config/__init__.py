@@ -40,6 +40,7 @@ from pathlib import Path
 
 from josu.config.chains import ChainsConfig, load_chains_config
 from josu.config.delegate import DelegateConfig, load_delegate_config
+from josu.config.graph_engines import GraphEnginesConfig, load_graph_engines_config
 from josu.config.orchestrator import OrchestratorConfig, load_orchestrator_config
 
 DEFAULT_CONFIG_DIRNAME = "josu"
@@ -105,6 +106,7 @@ class JosuConfig:
     delegate: DelegateConfig
     chains: ChainsConfig = field(default_factory=ChainsConfig)
     orchestrator: OrchestratorConfig = field(default_factory=OrchestratorConfig)
+    graph_engines: GraphEnginesConfig = field(default_factory=GraphEnginesConfig)
     wall_clock_timeout_seconds: float = DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS
     warnings: list[str] = field(default_factory=list)
 
@@ -191,6 +193,9 @@ def load_config(path: Path | None = None, *, strict: bool = False) -> JosuConfig
     orchestrator_config, orchestrator_warnings = load_orchestrator_config(data)
     warnings.extend(orchestrator_warnings)
 
+    graph_engines_config, graph_engines_warnings = load_graph_engines_config(data)
+    warnings.extend(graph_engines_warnings)
+
     wall_clock_timeout_seconds, wall_clock_warnings = _load_wall_clock_timeout_seconds(data)
     warnings.extend(wall_clock_warnings)
 
@@ -199,6 +204,7 @@ def load_config(path: Path | None = None, *, strict: bool = False) -> JosuConfig
         delegate=delegate_config,
         chains=chains_config,
         orchestrator=orchestrator_config,
+        graph_engines=graph_engines_config,
         wall_clock_timeout_seconds=wall_clock_timeout_seconds,
         warnings=warnings,
     )

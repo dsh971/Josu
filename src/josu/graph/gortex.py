@@ -1,21 +1,24 @@
 """gortex-backed implementation of the GraphEngine interface (R10, U1).
 
-Replaces graphify's in-process, in-memory `GraphifyEngine` (`build.py`,
-removed) with an async `httpx` client talking to a gortex subprocess (U15
-owns spawning/health-checking it; this module only needs a base URL).
+An async `httpx` client talking to a gortex daemon the user runs and
+manages themselves -- josu never spawns it (see `daemon.py`, `config/
+graph_engines.py`). This module only needs a base URL and, optionally, a
+bearer token the user configured via `[[graph.engines]]`'s `api_key_env`.
 
 Gortex's real dispatch primitive is `POST /v1/tools/{name}` -- "invoke any
 tool by name with a JSON argument object" -- reachable directly via `httpx`
 without standing up an MCP client inside the daemon. `execute(operation,
-params)` maps onto this directly: any of gortex's ~180 native tool names
-(or its 21-tool compact facade) is a valid `operation` string, which is
-what makes gortex's rich surface reachable through R12's fixed two-tool MCP
-schema without hand-wrapping each one. `search(query, limit)` calls
-gortex's own `search` tool the same way. `build`/`update` call
-`index_repository`/`reindex_repository` respectively -- `update()` honors
-the caller-supplied `changed_files` list directly (passed as gortex's
-`paths` argument), unlike graphify's `GraphifyEngine.update()`, which
-ignored it and recomputed its own via graphify's manifest.
+params)` maps onto this directly: any of gortex's tool names (the
+`facade-v1` preset's ~21-tool compact surface, which the daemon requires
+the configured target to be started with -- see `graph/gortex_process.py`'s
+capability check) is a valid `operation` string. `search(query, limit)`
+calls gortex's own `search` tool the same way.
+
+`build()`/`update()` are no-ops: `index_repository`/`reindex_repository`
+don't exist in gortex's current tool surface (confirmed live -- HTTP 404),
+and since josu never runs `gortex track` itself either, there is nothing
+left for either method to do. Tracking and reindexing are entirely the
+user's own gortex's business, continuously, via its own fsnotify watcher.
 """
 
 from __future__ import annotations
@@ -90,18 +93,21 @@ def _attach_caveat(result: dict) -> dict:
 
 
 class GortexEngine:
-    """Directory-scoped context graph backed by a gortex subprocess, reached
-    over `POST /v1/tools/{name}`. Owns no subprocess lifecycle of its own --
-    `base_url` must already point at a reachable gortex instance (U15's job)."""
+    """Directory-scoped context graph backed by a user-run gortex daemon,
+    reached over `POST /v1/tools/{name}`. Owns no process lifecycle of its
+    own -- `base_url` must already point at a reachable, correctly-
+    configured gortex instance (`daemon.py`'s job to resolve and verify)."""
 
     def __init__(
         self,
         base_url: str,
         *,
+        auth_token: str | None = None,
         timeout: float = DEFAULT_CLIENT_TIMEOUT_SECONDS,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        self._auth_token = auth_token
         self._timeout = timeout
         self._max_response_bytes = max_response_bytes
 
@@ -136,9 +142,10 @@ class GortexEngine:
                 reason="http-error",
             )
         url = f"{self._base_url}/v1/tools/{name}"
+        headers = {"Authorization": f"Bearer {self._auth_token}"} if self._auth_token else {}
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
-                async with client.stream("POST", url, json=params) as response:
+                async with client.stream("POST", url, json=params, headers=headers) as response:
                     if response.status_code >= 400:
                         raise GortexUnavailableError(
                             f"HTTP {response.status_code} from {url}", reason="http-error"
@@ -187,18 +194,18 @@ class GortexEngine:
         return data
 
     async def build(self, root: Path) -> None:
-        """Full index of the directory tree (R9)."""
-        await self._call_tool("index_repository", {"repo": str(root.resolve())})
+        """No-op -- `index_repository` doesn't exist in gortex's current
+        tool surface (HTTP 404, confirmed live). Getting a repo tracked is
+        the user's own `gortex track` setup step now, not something josu
+        triggers via a tool call."""
+        return None
 
     async def update(self, root: Path, changed_files: list[Path]) -> None:
-        """Incremental re-index scoped to `changed_files` (R14). Unlike
-        graphify's `GraphifyEngine.update()`, this honors the caller-supplied
-        list directly rather than recomputing its own -- gortex's
-        `reindex_repository` tool accepts an explicit `paths` argument."""
-        await self._call_tool(
-            "reindex_repository",
-            {"repo": str(root.resolve()), "paths": [str(f) for f in changed_files]},
-        )
+        """No-op -- `reindex_repository` doesn't exist in gortex's current
+        tool surface either. Reindexing is owned entirely, continuously,
+        by the user's own gortex daemon's fsnotify watcher once a repo is
+        tracked -- there is nothing left for josu to trigger here."""
+        return None
 
     async def search(self, query: str, limit: int = 10) -> list[dict]:
         result = await self._call_tool("search", {"query": query, "limit": limit})

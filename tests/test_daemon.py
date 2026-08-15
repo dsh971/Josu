@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import threading
+from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
@@ -58,6 +59,24 @@ def fake_gortex_server():
     separately in `tests/graph/test_gortex.py`)."""
 
     class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            # `check_gortex_reachable()`'s `/healthz` probe -- a real gortex
+            # answers GET here; without this, any test that goes through
+            # the real `_resolve_graph_engine_target()` path (as opposed to
+            # the `gortex_process=` test seam, which never calls it) would
+            # get a 501 from BaseHTTPRequestHandler's default and silently
+            # degrade to "unreachable" regardless of what it meant to test.
+            if self.path != "/healthz":
+                self.send_response(404)
+                self.end_headers()
+                return
+            payload = json.dumps({"status": "ok"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
         def do_POST(self):
             if self.path == "/v1/tools/search":
                 body = {"results": [{"id": "helper.py::greet"}]}
@@ -77,10 +96,25 @@ def fake_gortex_server():
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
 
-    yield GortexProcess(host="127.0.0.1", port=httpd.server_port, popen=None)
+    yield GortexProcess(host="127.0.0.1", port=httpd.server_port)
 
     httpd.shutdown()
     thread.join()
+
+
+def _force_no_local_gortex_binary(monkeypatch) -> None:
+    """Make `check_gortex_version_compatible()` take its "binary absent"
+    degrade path regardless of whether this machine happens to have a
+    real `gortex` on PATH -- several tests below target a loopback host,
+    so without this their pass/fail would depend on whatever `gortex`
+    version is actually installed locally (confirmed: this dev machine
+    has v0.62.0, exactly at the compatibility floor, silently masking
+    what should be a deterministic, environment-independent test)."""
+
+    def _raise_not_found(*args, **kwargs):
+        raise FileNotFoundError()
+
+    monkeypatch.setattr("josu.graph.gortex_process.subprocess.run", _raise_not_found)
 
 
 def _write_fixture_josu_toml(path, *, second_candidate=False) -> None:
@@ -131,12 +165,14 @@ def daemon_token(fixture_config_path):
     return resolve_daemon_token(fixture_config_path)
 
 
-@pytest_asyncio.fixture
-async def running_daemon(tmp_path, fixture_repo, fixture_config_path, fake_gortex_server):
+@asynccontextmanager
+async def _running_app(app):
+    """Start a real uvicorn server for `app` and yield its base URL,
+    tearing the server down on exit -- the shared plumbing behind both
+    the `running_daemon` fixture (built from the shared fixtures below)
+    and `_run_app_and_search` (drives one MCP call against a custom,
+    per-test app/config)."""
     port = _free_port()
-    app = create_app(
-        target=fixture_repo, config_path=fixture_config_path, gortex_process=fake_gortex_server
-    )
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
     server = uvicorn.Server(config)
     task = asyncio.create_task(server.serve())
@@ -144,9 +180,20 @@ async def running_daemon(tmp_path, fixture_repo, fixture_config_path, fake_gorte
         if server.started:
             break
         await asyncio.sleep(0.05)
-    yield f"http://127.0.0.1:{port}"
-    server.should_exit = True
-    await task
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        await task
+
+
+@pytest_asyncio.fixture
+async def running_daemon(tmp_path, fixture_repo, fixture_config_path, fake_gortex_server):
+    app = create_app(
+        target=fixture_repo, config_path=fixture_config_path, gortex_process=fake_gortex_server
+    )
+    async with _running_app(app) as base_url:
+        yield base_url
 
 
 @pytest.mark.asyncio
@@ -183,11 +230,11 @@ async def test_daemon_route_rejects_missing_or_wrong_token(running_daemon):
 def test_create_app_constructs_gortex_engine_without_blocking_on_full_index(
     tmp_path, fixture_repo, fixture_config_path, fake_gortex_server
 ):
-    """Key Technical Decisions: `create_app()` blocks on the gortex
-    subprocess's `/healthz` liveness only (satisfied here by the fixture
-    server always answering), never on a full index completing -- there is
-    no `engine.build()` call at startup at all for `GortexEngine` (gortex
-    indexes the path it was spawned with as part of starting up)."""
+    """`create_app()` blocks on the configured target's `/healthz`
+    liveness only (satisfied here by the fixture server always answering),
+    never on a full index completing -- there is no `engine.build()` call
+    at startup at all for `GortexEngine` (build/update are no-ops now;
+    tracking is the user's own `gortex track` setup step)."""
     app = create_app(
         target=fixture_repo, config_path=fixture_config_path, gortex_process=fake_gortex_server
     )
@@ -197,8 +244,8 @@ def test_create_app_constructs_gortex_engine_without_blocking_on_full_index(
 def test_create_app_prints_no_warning_for_a_correctly_permissioned_config(
     tmp_path, fixture_repo, fixture_config_path, fake_gortex_server, capsys
 ):
-    """U4 (feat/cli-ease-of-use plan): a `josu.toml` with correct (0o600)
-    permissions and no other warnings produces no warning output."""
+    """A `josu.toml` with correct (0o600) permissions and no other
+    warnings produces no warning output."""
     create_app(
         target=fixture_repo, config_path=fixture_config_path, gortex_process=fake_gortex_server
     )
@@ -208,7 +255,7 @@ def test_create_app_prints_no_warning_for_a_correctly_permissioned_config(
 def test_create_app_prints_permission_warning_for_a_group_world_readable_config(
     tmp_path, fixture_repo, fake_gortex_server, capsys
 ):
-    """U4: `config.warnings` (e.g. the group/world-readable permission
+    """`config.warnings` (e.g. the group/world-readable permission
     warning) previously had no code path reading it anywhere -- this
     confirms it now actually reaches stdout at daemon startup, not just
     that `create_app()`'s return value is unaffected."""
@@ -223,103 +270,259 @@ def test_create_app_prints_permission_warning_for_a_group_world_readable_config(
     assert "group/world-accessible" in out
 
 
-def test_create_app_terminates_a_process_it_spawned_if_construction_fails_after(
-    tmp_path, fixture_repo, fixture_config_path, monkeypatch
-):
-    """A gortex subprocess `create_app()` itself spawned (not the test-seam
-    `gortex_process` handle) must not be leaked if something after the
-    spawn raises -- e.g. a malformed config causing delegate-server
-    construction to fail. `terminate_gortex()` should still run even
-    though `lifespan`'s teardown never gets a chance to (the app was never
-    constructed)."""
-    import josu.daemon as daemon_module
-    from josu.graph.gortex_process import GortexProcess
-
-    terminated: list[GortexProcess] = []
-    fake_process = GortexProcess(host="127.0.0.1", port=1, popen=object())
-
-    monkeypatch.setattr(daemon_module, "_ensure_gortex_running", lambda *a, **k: fake_process)
-    monkeypatch.setattr(
-        daemon_module, "terminate_gortex", lambda p: terminated.append(p)
-    )
-
-    def _boom(**kwargs):
-        raise RuntimeError("simulated failure constructing the delegate server")
-
-    monkeypatch.setattr(daemon_module, "build_delegate_server", _boom)
-
-    with pytest.raises(RuntimeError, match="simulated failure"):
-        create_app(target=fixture_repo, config_path=fixture_config_path)
-
-    assert terminated == [fake_process]
-
-
-def test_create_app_does_not_terminate_a_caller_supplied_process_if_construction_fails(
+def test_create_app_resolves_a_configured_and_reachable_target_from_config(
     fixture_repo, fixture_config_path, fake_gortex_server, monkeypatch
 ):
-    """Complements the test above: a `gortex_process` the CALLER supplied
-    (the test seam) is never this `create_app()` call's to terminate, even
-    when construction fails after it -- this daemon instance didn't spawn
-    it (see `daemon.py`'s `owns_gortex_process` flag, reliability-review
-    fix). Regression coverage for the asymmetry that fix closed: the
-    construction-failure branch already guarded on this correctly before
-    the fix; only `lifespan`'s clean-shutdown teardown didn't."""
-    import josu.daemon as daemon_module
+    """The real (non-test-seam) path: a `[[graph.engines]]` entry pointing
+    at a reachable target resolves and constructs cleanly, with no
+    `gortex_process=` override. Verified via a real MCP `search` call
+    returning the fixture server's canned result -- `app is not None`
+    alone would pass even if resolution silently failed and the engine
+    ended up unset, which is exactly what happened here before the
+    `fake_gortex_server` fixture grew a `/healthz` handler."""
+    _force_no_local_gortex_binary(monkeypatch)
+    text = fixture_config_path.read_text(encoding="utf-8")
+    text += f"""
+[[graph.engines]]
+name = "gortex"
+host = "{fake_gortex_server.host}"
+port = {fake_gortex_server.port}
+"""
+    fixture_config_path.write_text(text, encoding="utf-8")
 
-    terminated: list = []
-    monkeypatch.setattr(
-        daemon_module, "terminate_gortex", lambda p: terminated.append(p)
-    )
+    app = create_app(target=fixture_repo, config_path=fixture_config_path)
+    assert app is not None
+    token = resolve_daemon_token(fixture_config_path)
+    result_text = asyncio.run(_run_app_and_search(app, token, "greet"))
+    assert "helper.py::greet" in result_text
 
-    def _boom(**kwargs):
-        raise RuntimeError("simulated failure constructing the delegate server")
 
-    monkeypatch.setattr(daemon_module, "build_delegate_server", _boom)
+def test_create_app_starts_with_no_engine_when_configured_target_is_unreachable(
+    fixture_repo, fixture_config_path
+):
+    """An unreachable configured target degrades to no graph engine --
+    `create_app()` must still succeed (R1), not raise -- and a real MCP
+    caller sees the "unreachable" reason, not a silently-working engine."""
+    text = fixture_config_path.read_text(encoding="utf-8")
+    text += """
+[[graph.engines]]
+name = "gortex"
+host = "127.0.0.1"
+port = 1
+"""
+    fixture_config_path.write_text(text, encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="simulated failure"):
-        create_app(
-            target=fixture_repo,
-            config_path=fixture_config_path,
-            gortex_process=fake_gortex_server,
+    app = create_app(target=fixture_repo, config_path=fixture_config_path)
+    assert app is not None
+    token = resolve_daemon_token(fixture_config_path)
+    result_text = asyncio.run(_run_app_and_search(app, token))
+    assert "not reachable" in result_text
+
+
+def test_create_app_starts_with_no_engine_when_nothing_is_configured(
+    fixture_repo, fixture_config_path
+):
+    """No `[[graph.engines]]` section at all is the valid, expected
+    "no engine configured" state (R7) -- `create_app()` still succeeds,
+    and a real MCP caller gets the "unconfigured" reason."""
+    app = create_app(target=fixture_repo, config_path=fixture_config_path)
+    assert app is not None
+    token = resolve_daemon_token(fixture_config_path)
+    result_text = asyncio.run(_run_app_and_search(app, token))
+    assert "no graph-engine target is configured" in result_text
+
+
+async def _search_via_mcp(base_url: str, token: str, query: str = "anything"):
+    async with sse_client(f"{base_url}/graph/sse?token={token}") as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            return await session.call_tool("search", {"query": query})
+
+
+async def _run_app_and_search(app, token: str, query: str = "anything"):
+    """Drive one real MCP `search` call over SSE against `app` and return
+    the resulting text -- proving actual engine-availability behavior
+    end-to-end (not just that `create_app()` didn't raise)."""
+    async with _running_app(app) as base_url:
+        result = await _search_via_mcp(base_url, token, query)
+        return result.content[0].text
+
+
+def test_create_app_starts_with_no_engine_when_version_incompatible(
+    fixture_repo, fixture_config_path, fake_gortex_server, monkeypatch
+):
+    """A configured, reachable target whose local `gortex` binary reports
+    a version below the compatibility floor degrades to no graph engine --
+    `create_app()` succeeds (R1), and the specific "version-incompatible"
+    reason (not the generic "unconfigured" fallback) reaches a real MCP
+    caller, proving both the degrade-branch wiring and the reason-
+    threading fix work end-to-end."""
+    text = fixture_config_path.read_text(encoding="utf-8")
+    text += f"""
+[[graph.engines]]
+name = "gortex"
+host = "{fake_gortex_server.host}"
+port = {fake_gortex_server.port}
+"""
+    fixture_config_path.write_text(text, encoding="utf-8")
+
+    def _fake_run(*args, **kwargs):
+        import subprocess
+
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout="gortex v0.10.0+deadbeef\n", stderr=""
         )
 
-    assert terminated == []
+    monkeypatch.setattr("josu.graph.gortex_process.subprocess.run", _fake_run)
+
+    app = create_app(target=fixture_repo, config_path=fixture_config_path)
+    assert app is not None
+    token = resolve_daemon_token(fixture_config_path)
+    result_text = asyncio.run(_run_app_and_search(app, token))
+    assert "incompatible version" in result_text
 
 
-@pytest.mark.asyncio
-async def test_lifespan_teardown_does_not_terminate_a_caller_supplied_process(
-    fixture_repo, fixture_config_path, fake_gortex_server, monkeypatch
+def test_create_app_starts_with_no_engine_when_tool_surface_incapable(
+    fixture_repo, fixture_config_path, monkeypatch
 ):
-    """Regression coverage for the `lifespan`-teardown half of the same
-    `owns_gortex_process` fix: a real uvicorn server, constructed with a
-    caller-supplied `gortex_process`, taken through a full clean
-    start-then-shutdown cycle (the actual ASGI lifespan path, not a direct
-    call to the `lifespan` context manager) must not call `terminate_gortex`
-    on that process during shutdown -- before the fix, `lifespan`'s
-    teardown called it unconditionally."""
-    import josu.daemon as daemon_module
+    """A configured, reachable target that responds to the capability
+    probe with `tool_blocked_by_mode` (started with the wrong `--tools`
+    preset) degrades to no graph engine -- and the "incapable" reason
+    reaches a real MCP caller, not the generic fallback."""
 
-    terminated: list = []
-    monkeypatch.setattr(
-        daemon_module, "terminate_gortex", lambda p: terminated.append(p)
-    )
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            payload = json.dumps({"status": "ok"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
 
-    port = _free_port()
-    app = create_app(
-        target=fixture_repo, config_path=fixture_config_path, gortex_process=fake_gortex_server
-    )
-    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
-    server = uvicorn.Server(config)
-    task = asyncio.create_task(server.serve())
-    for _ in range(50):
-        if server.started:
-            break
-        await asyncio.sleep(0.05)
+        def do_POST(self):
+            body = {
+                "isError": True,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": '{"error_code":"tool_blocked_by_mode"}',
+                    }
+                ],
+            }
+            payload = json.dumps(body).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
 
-    server.should_exit = True
-    await task
+        def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+            pass
 
-    assert terminated == []
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        text = fixture_config_path.read_text(encoding="utf-8")
+        text += f"""
+[[graph.engines]]
+name = "gortex"
+host = "127.0.0.1"
+port = {httpd.server_port}
+"""
+        fixture_config_path.write_text(text, encoding="utf-8")
+        _force_no_local_gortex_binary(monkeypatch)
+
+        app = create_app(target=fixture_repo, config_path=fixture_config_path)
+        assert app is not None
+        token = resolve_daemon_token(fixture_config_path)
+        result_text = asyncio.run(_run_app_and_search(app, token))
+        assert "tool preset" in result_text
+    finally:
+        httpd.shutdown()
+        thread.join()
+
+
+def test_create_app_resolves_auth_token_from_api_key_env_end_to_end(
+    fixture_repo, fixture_config_path, monkeypatch
+):
+    """The full chain, end-to-end through the real (non-test-seam) config-
+    loading path: a `[[graph.engines]]` entry's `api_key_env` names an
+    environment variable -> `_resolve_graph_engine_target()` resolves it
+    via `os.environ.get()` -> `GortexEngine` sends it as `Authorization:
+    Bearer <token>` on both the `/healthz` reachability probe and the real
+    `/v1/tools/search` call. Each link is unit-tested elsewhere (config
+    parsing in test_graph_engines.py, header-sending given a token in
+    test_gortex.py) but nothing previously proved the daemon actually
+    wires them together starting from a real TOML file and a real env
+    var."""
+    monkeypatch.setenv("JOSU_TEST_GORTEX_TOKEN", "end-to-end-secret-value")
+    _force_no_local_gortex_binary(monkeypatch)
+
+    seen_headers: dict = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen_headers["healthz"] = dict(self.headers)
+            payload = json.dumps({"status": "ok"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            seen_headers[self.path] = dict(self.headers)
+            if self.path == "/v1/tools/search":
+                body = {"results": [{"id": "helper.py::greet"}]}
+            else:
+                body = {"status": "ok"}
+            payload = json.dumps(body).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        text = fixture_config_path.read_text(encoding="utf-8")
+        text += f"""
+[[graph.engines]]
+name = "gortex"
+host = "127.0.0.1"
+port = {httpd.server_port}
+api_key_env = "JOSU_TEST_GORTEX_TOKEN"
+"""
+        fixture_config_path.write_text(text, encoding="utf-8")
+
+        app = create_app(target=fixture_repo, config_path=fixture_config_path)
+        assert app is not None
+
+        # The reachability probe already happened synchronously inside
+        # create_app() -- assert it carried the token too (this is the
+        # fix from the earlier skeptical review: check_gortex_reachable()
+        # used to be called before auth_token was even resolved).
+        assert (
+            seen_headers.get("healthz", {}).get("Authorization")
+            == "Bearer end-to-end-secret-value"
+        )
+
+        token = resolve_daemon_token(fixture_config_path)
+        result_text = asyncio.run(_run_app_and_search(app, token, "greet"))
+        assert "helper.py::greet" in result_text
+        assert (
+            seen_headers.get("/v1/tools/search", {}).get("Authorization")
+            == "Bearer end-to-end-secret-value"
+        )
+    finally:
+        httpd.shutdown()
+        thread.join()
 
 
 @pytest.mark.asyncio
@@ -397,13 +600,14 @@ async def test_daemon_serves_internal_delegate_route_over_real_http(
 
 
 @pytest.mark.asyncio
-async def test_daemon_serves_internal_graph_reindex_route_over_real_http(
+async def test_daemon_no_longer_serves_an_internal_graph_reindex_route(
     running_daemon, daemon_token, fixture_repo
 ):
-    """The new `/graph/internal/reindex` route (doc-review bug fix) reaches
-    the daemon's own live `GortexEngine` -- proven here by asserting the
-    fixture gortex server actually received the `reindex_repository` call
-    with the changed-file paths, not a throwaway engine instance."""
+    """The `/graph/internal/reindex` route was retired (gortex integration
+    rework, U5) -- its only production callers (josu's own commit/merge
+    reindex triggers) were retired alongside it (R4), and its handler
+    called a now-no-op `engine.update()`. Confirms the route is genuinely
+    gone, not silently left wired but broken."""
     token = daemon_token
     changed_file = str(fixture_repo / "helper.py")
     async with httpx.AsyncClient(base_url=running_daemon) as client:
@@ -412,8 +616,7 @@ async def test_daemon_serves_internal_graph_reindex_route_over_real_http(
             json={"root": str(fixture_repo), "changed_files": [changed_file]},
             headers={"Authorization": f"Bearer {token}"},
         )
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.status_code == 404
 
 
 def test_josu_delegate_cli_with_no_daemon_running_produces_clear_error(capsys):
