@@ -1,19 +1,13 @@
 # Using josu
 
-A deeper, practical companion to [README.md](../README.md)'s quick start — real command output, full config field reference, and current known limitations. Read the README first for *why* josu exists; this doc is about actually running it.
-
-## Known limitation: the daemon doesn't start today
-
-**`josu daemon start`, and everything that depends on it (`josu run`, `josu delegate`), currently fail against the real [gortex](https://github.com/zzet/gortex) CLI.** Gortex's flag surface has moved since josu's integration was written — `--http-addr` no longer exists (gortex now uses `--bind`/`--port`), `--index`/`--no-daemon` are silently-ignored no-ops on gortex's current "auto-start a daemon and proxy to it" model, and the `/healthz` endpoint josu polls for readiness doesn't respond. This is a real, open issue, not a config mistake on your end — a correctly-configured `josu.toml` and a working `gortex` install will still hit it.
-
-What this means in practice: `josu init`, `josu log`, and `josu cleanup` all work today, in full, without the daemon. `josu daemon start`, `josu run`, and `josu delegate` do not — you'll see gortex's own raw CLI usage text dumped to your terminal when you try. There's no workaround short of the gortex-compatibility fix landing; this doc will drop this section once it does.
+A deeper, practical companion to [README.md](../README.md)'s quick start — real command output and full config field reference. Read the README first for *why* josu exists; this doc is about actually running it.
 
 ## Prerequisites
 
 - **Python 3.12+ and [uv](https://docs.astral.sh/uv/).** You don't need to manually install Python 3.12 yourself — `uv sync` provisions its own managed Python 3.12 toolchain automatically, even if your system's default `python3` is older.
-- **The [`gortex`](https://github.com/zzet/gortex) CLI on `PATH`** — only actually reachable once the [known limitation](#known-limitation-the-daemon-doesnt-start-today) above is resolved, but install it now so you're ready: `curl -fsSL https://get.gortex.dev | sh`.
+- **The [`gortex`](https://github.com/zzet/gortex) CLI, running and tracking your repo** — `curl -fsSL https://get.gortex.dev | sh` to install, then `gortex daemon start --http-addr 127.0.0.1:7411 --tools facade-v1 --detach && gortex track /path/to/your/repo --wait` to start and track your repo yourself. josu connects to this target if it's reachable and degrades gracefully to direct file exploration otherwise — it never installs, starts, or tracks gortex on your behalf. Skipping this entirely is fine too.
 - **An OpenAI-chat-compatible local server** for the delegate worker — [Ollama](https://ollama.com) serving its `/v1` endpoint is the reference target. Only needed once you configure at least one local delegate candidate; not needed for `init`/`log`/`cleanup`.
-- **A hosted CLI agent on `PATH`** — currently only [`claude`](https://claude.com/product/claude-code) — only needed for `josu run` once the daemon works; not needed for anything covered in this doc today.
+- **A hosted CLI agent on `PATH`** — currently only [`claude`](https://claude.com/product/claude-code) — only needed for `josu run`; not needed for anything covered in this doc today.
 
 ## Install
 
@@ -72,7 +66,7 @@ candidates = ["local-qwen", "remote-fallback"]
 
 `api_key_env` names an environment variable — josu reads the variable's value at call time, never stores or logs it. There's no `api_key` field at all; the schema has no place to put a raw secret. If you reference an env var that isn't actually set, josu warns (see [Permission and validation warnings](#permission-and-validation-warnings)) rather than crashing.
 
-### Orchestrator adapter (for `josu run`, once the daemon works)
+### Orchestrator adapter (for `josu run`)
 
 ```toml
 [orchestrator]
@@ -88,6 +82,16 @@ mcp_approval_verified = { verified = true, verified_date = 2026-01-01 }
 ```
 
 See `src/josu/CLAUDE.md.template` for the fuller delegation-guide prose worth adapting into your own project's `CLAUDE.md`.
+
+### Graphify (Excel/Word/Google-Workspace files)
+
+gortex doesn't ingest `.docx`/`.xlsx`/`.gdoc`/`.gsheet`/`.gslides` files at all — josu routes those to a narrow secondary engine, graphify, instead. It's opt-in, not installed by default:
+
+```bash
+uv sync --extra graphify
+```
+
+`.docx`/`.xlsx` convert in-process once that extra is installed — no further setup needed. `.gdoc`/`.gsheet`/`.gslides` (Google Workspace shortcut files) additionally require a separate, user-installed `gws` CLI ([googleworkspace/cli](https://github.com/googleworkspace/cli)), authenticated via your own `gws auth login` — josu never touches that credential. Without `gws` installed and authenticated, a `.gdoc`/`.gsheet`/`.gslides` request degrades to a clear error rather than a crash. There's nothing to configure in `josu.toml` for graphify itself — it's routed automatically by file extension.
 
 ### File permissions
 
@@ -137,7 +141,7 @@ If you already have a Husky, `pre-commit`, or hand-written `post-commit` hook, `
 
 ### `josu log [run_id]`
 
-Renders a run-log record — defaults to the most recently started run if you omit `run_id`. Before any runs exist yet (which is the case until the daemon works):
+Renders a run-log record — defaults to the most recently started run if you omit `run_id`. Before any runs exist yet:
 
 ```console
 $ uv run josu log
@@ -157,12 +161,18 @@ Run `josu <command> --help` for the full, current flag list on any command — i
 
 ### `josu daemon start`, `josu run`, `josu delegate`
 
-Documented in [README.md](../README.md#run-it) for the intended flow. Blocked today — see [Known limitation](#known-limitation-the-daemon-doesnt-start-today) at the top of this doc.
+Documented in [README.md](../README.md#run-it) for the intended flow. `josu daemon start` runs the daemon in the foreground, connecting to your configured `[[graph.engines]]` target if reachable (degrading gracefully to no graph engine otherwise, never blocking startup — see [Graph engine connectivity](#graph-engine-connectivity) below). `josu run`/`josu delegate` both require the daemon already running.
+
+## Graph engine connectivity
+
+josu never installs, starts, or tracks gortex on your behalf — it connects to whatever `[[graph.engines]]` target you declared in `josu.toml`, the same way you already run the hosted CLI agent yourself. At `josu daemon start`, the target is checked for reachability, gortex version compatibility, and tool-surface capability (the target must be running with `--tools facade-v1`); any failure prints a `josu daemon: warning: ...` line naming what's wrong and the daemon starts anyway with no graph engine for that session, rather than failing to start.
+
+An unreachable target isn't a permanent state for the session, either — a later graph query automatically rechecks the target (rate-limited to roughly once every 30 seconds), so a gortex you start *after* `josu daemon start` becomes usable without restarting josu's daemon.
+
+**`josu daemon start`'s `--target` flag is unrelated to any of this.** It scopes graphify file reads and crash-orphaned-worktree scanning to a repo root (default: cwd) — it has no effect on which graph engine is used or connected to; that's entirely `[[graph.engines]]`'s job in `josu.toml`.
 
 ## Troubleshooting
 
-**`josu daemon not reachable at 127.0.0.1:8765 -- start it with josu daemon start`** — exactly what it says: `josu run` and `josu delegate` both need a running daemon first. Right now, starting that daemon is itself blocked (see [Known limitation](#known-limitation-the-daemon-doesnt-start-today)).
-
-**`gortex exited with code 1 during startup: Error: unknown flag: --http-addr`** — the known gortex-compatibility issue. Not something you can fix locally by changing config.
+**`josu daemon not reachable at 127.0.0.1:8765 -- start it with josu daemon start`** — exactly what it says: `josu run` and `josu delegate` both need a running daemon first.
 
 **A config warning appears every time you run a command** — the warning reflects the actual current state of `josu.toml`; it'll stop once you fix what it names (permissions, a malformed entry, an unset env var).
