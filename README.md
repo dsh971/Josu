@@ -8,7 +8,7 @@ AI coding tools are becoming central to how developers work, but cost is a real 
 
 An earlier version of this project tried the opposite shape — a local model as the primary driver, escalating to a hosted agent when stuck. The evidence didn't support it: local models in the hardware-realistic range are strong at bounded, well-specified tasks but collapse specifically on sustained multi-turn tool-calling, which is exactly what "primary orchestrator" requires. So josu flips that: the hosted agent stays in the driver's seat, doing what it's already good at, and hands off the bounded, low-complexity pieces to a delegate worker — local-first, with remote open-weight models as a fallback once they clear a real capability bar.
 
-Neither model re-derives context from scratch to do this. Both query a shared, incrementally-maintained code-relationship graph, so delegating a summary doesn't cost the hosted agent tokens just to explain what needs summarizing.
+Neither model has to re-derive context from scratch to do this. When a graph engine is configured and reachable, both query the same shared code-relationship graph — kept incrementally in sync by the graph engine's own watcher, not by josu — so delegating a summary doesn't cost the hosted agent tokens just to explain what needs summarizing. No target configured or reachable falls back to direct file exploration for both sides instead (see "Both sides share one context graph" below).
 
 ## What it does
 
