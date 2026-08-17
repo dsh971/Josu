@@ -173,6 +173,6 @@ An unreachable target isn't a permanent state for the session, either — a late
 
 ## Troubleshooting
 
-**`josu daemon not reachable at 127.0.0.1:8765 -- start it with josu daemon start`** — exactly what it says: `josu run` and `josu delegate` both need a running daemon first.
+**`` josu daemon not reachable at 127.0.0.1:8765 -- start it with `josu daemon start` ``** — exactly what it says: `josu run` and `josu delegate` both need a running daemon first.
 
 **A config warning appears every time you run a command** — the warning reflects the actual current state of `josu.toml`; it'll stop once you fix what it names (permissions, a malformed entry, an unset env var).
