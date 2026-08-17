@@ -34,6 +34,7 @@ for the caller to interpret.
 
 from __future__ import annotations
 
+import math
 import subprocess
 import time
 from collections.abc import Callable
@@ -75,8 +76,14 @@ class CircuitBreaker:
         *,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if timeout_seconds <= 0:
-            raise ValueError(f"timeout_seconds must be positive, got {timeout_seconds}")
+        # `<= 0` alone doesn't reject `nan`/`inf` (code-review fix, found
+        # via the identical gap in `config/__init__.py`'s cooldown-config
+        # loader): NaN comparisons are always False and `inf > 0` is True,
+        # so either would silently pass this guard and then make `check()`'s
+        # `elapsed > self.timeout_seconds` comparison always False too --
+        # permanently disabling R23's whole-run safety net with no error.
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError(f"timeout_seconds must be a positive, finite number, got {timeout_seconds}")
         self.timeout_seconds = timeout_seconds
         self._clock = clock
         self._accumulated: float = 0.0

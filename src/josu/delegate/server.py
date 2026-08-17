@@ -22,9 +22,11 @@ from pathlib import Path
 import mcp.types as types
 from mcp.server.lowlevel import Server
 
+from josu.config import DEFAULT_CANDIDATE_COOLDOWN_SECONDS, DEFAULT_CANDIDATE_FAILURE_THRESHOLD
 from josu.config.chains import ChainsConfig
 from josu.config.delegate import DelegateCandidate
 from josu.delegate import chain
+from josu.delegate.cooldown import CandidateCooldownStore
 from josu.delegate.local_model import DEFAULT_TIMEOUT_SECONDS
 from josu.delegate.queue import DelegateQueue
 from josu.graph.engine import GraphEngine
@@ -49,6 +51,7 @@ def build_server(
     name: str = "delegate-to-local",
     client_factory: chain.ClientFactory | None = None,
     queue: DelegateQueue | None = None,
+    cooldown_store: CandidateCooldownStore | None = None,
 ) -> Server:
     """Construct the low-level MCP server bound to the given graph engine and
     delegate-chain config.
@@ -69,9 +72,26 @@ def build_server(
     HTTP endpoint serialize through the SAME lock. A caller that doesn't
     supply one (e.g. every existing standalone test in `test_server.py`)
     still gets a fresh, private queue, unchanged from prior behavior.
+
+    `cooldown_store` (feat/delegate-candidate-circuit-breaker plan) follows
+    the exact same pattern for the same reason: `daemon.py`'s `create_app()`
+    constructs exactly one `CandidateCooldownStore` and passes it in here
+    AND into `delegate/internal_api.py`'s route, so a candidate tripped via
+    either path is skipped via both. A caller that doesn't supply one gets a
+    fresh, private store -- fine for standalone tests, but the real daemon
+    call site must always pass its shared instance, or cooldown state
+    silently stops sharing across the two paths.
     """
     server: Server = Server(name)
     queue = queue if queue is not None else DelegateQueue()
+    cooldown_store = (
+        cooldown_store
+        if cooldown_store is not None
+        else CandidateCooldownStore(
+            failure_threshold=DEFAULT_CANDIDATE_FAILURE_THRESHOLD,
+            cooldown_seconds=DEFAULT_CANDIDATE_COOLDOWN_SECONDS,
+        )
+    )
     resolved_chains_config = chains_config if chains_config is not None else ChainsConfig()
     resolved_registry: Mapping[str, DelegateCandidate] = registry if registry is not None else {}
 
@@ -128,6 +148,7 @@ def build_server(
                 chains_config=resolved_chains_config,
                 registry=resolved_registry,
                 queue=queue,
+                cooldown_store=cooldown_store,
                 graph_engine=graph_engine,
                 scope_root=scope_root,
                 client_factory=client_factory,

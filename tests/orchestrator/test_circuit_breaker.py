@@ -89,6 +89,13 @@ def test_timeout_seconds_must_be_positive():
         CircuitBreaker(-5)
 
 
+def test_timeout_seconds_must_be_finite():
+    with pytest.raises(ValueError):
+        CircuitBreaker(float("inf"))
+    with pytest.raises(ValueError):
+        CircuitBreaker(float("nan"))
+
+
 # --- queued-vs-executing exclusion (matches queue.py's own treatment) --------
 
 

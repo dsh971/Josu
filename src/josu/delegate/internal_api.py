@@ -83,6 +83,7 @@ from starlette.routing import Route
 from josu.config.chains import ChainsConfig, DelegationChain
 from josu.config.delegate import DelegateCandidate
 from josu.delegate import chain
+from josu.delegate.cooldown import CandidateCooldownStore
 from josu.delegate.local_model import DEFAULT_TIMEOUT_SECONDS
 from josu.delegate.queue import DelegateQueue
 from josu.graph.engine import GraphEngine
@@ -97,6 +98,20 @@ DELEGATE_INTERNAL_PATH = "/delegate/internal"
 MAX_BODY_BYTES = 2_000_000
 MAX_TASK_CHARS = 200_000
 MAX_SCOPE_BYTES = 200_000
+
+# Code-review fix: an unbounded `timeout` let a caller with a valid daemon
+# token weaponize the SHARED `cooldown_store` (feat/delegate-candidate-
+# circuit-breaker plan) -- one request with a near-zero timeout against a
+# multi-candidate chain fails every candidate almost instantly under
+# `queue.run_chain()`'s single lock hold, tripping every candidate into
+# cooldown for every OTHER caller (the MCP tool path included), not just
+# this request. Before that shared store existed, a bad timeout only hurt
+# the request that sent it. 600s (10 minutes) is generous for one bounded
+# delegate call while still bounding the blast radius. `allow_inf_nan=False`
+# closes the same nan/inf validation gap this plan's config loader was
+# hardened against, for the same reason: `json.loads()` accepts
+# `Infinity`/`NaN` by default, and `<= 0`-only checks don't reject either.
+MAX_DELEGATE_TIMEOUT_SECONDS = 600.0
 
 # An internal-only chain key used to wire a client-supplied, pre-resolved
 # candidate list through `execute_chain()`'s `chains_config`/`registry`
@@ -123,7 +138,9 @@ class DelegateInternalRequest(BaseModel):
     # resolved against the daemon's own trusted `registry` server-side,
     # never taken at face value from the request body.
     candidates: list[str] | None = None
-    timeout: float | None = None
+    timeout: float | None = Field(
+        default=None, gt=0, le=MAX_DELEGATE_TIMEOUT_SECONDS, allow_inf_nan=False
+    )
 
     @model_validator(mode="after")
     def _validate_shape(self) -> "DelegateInternalRequest":
@@ -142,6 +159,7 @@ class DelegateInternalRequest(BaseModel):
 def build_delegate_internal_route(
     *,
     queue: DelegateQueue,
+    cooldown_store: CandidateCooldownStore,
     chains_config: ChainsConfig,
     registry: Mapping[str, DelegateCandidate],
     graph_engine: GraphEngine | None = None,
@@ -151,11 +169,13 @@ def build_delegate_internal_route(
 ) -> Route:
     """Build the Starlette `Route` handling U14's internal POST endpoint.
 
-    `queue`/`chains_config`/`registry` must be the SAME instances
-    `daemon.py`'s `create_app()` passes into `build_delegate_server()` --
-    the whole point of this unit is that the MCP tool and this route
-    serialize through one shared `DelegateQueue`, not two independently
-    constructed ones.
+    `queue`/`cooldown_store`/`chains_config`/`registry` must be the SAME
+    instances `daemon.py`'s `create_app()` passes into
+    `build_delegate_server()` -- the whole point of this unit (and of
+    threading `cooldown_store` the same way, feat/delegate-candidate-
+    circuit-breaker plan) is that the MCP tool and this route serialize
+    through one shared `DelegateQueue` and see one shared cooldown state,
+    not independently constructed ones.
     """
 
     async def handle(request: Request) -> JSONResponse:
@@ -233,6 +253,7 @@ def build_delegate_internal_route(
                 chains_config=resolved_chains_config,
                 registry=resolved_registry,
                 queue=queue,
+                cooldown_store=cooldown_store,
                 graph_engine=graph_engine,
                 scope_root=scope_root,
                 client_factory=client_factory,
