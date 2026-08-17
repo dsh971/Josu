@@ -599,6 +599,94 @@ async def test_daemon_serves_internal_delegate_route_over_real_http(
     assert "pong" in body["result"].lower()
 
 
+def _write_dead_candidate_josu_toml(path, *, failure_threshold=1, cooldown_seconds=300.0) -> None:
+    """A single candidate pointed at `127.0.0.1:1` -- a port that refuses
+    the connection near-instantly on any dev/CI machine, giving a fast,
+    deterministic `DelegateUnreachableError` with no real network hang.
+    `model` deliberately isn't in `CURATED_MODELS`, so `preflight_check`
+    trivially passes and the failure genuinely comes from the connection
+    attempt, matching `test_chain.py`'s `_candidate()` convention."""
+    path.write_text(
+        f"""
+[delegate]
+failure_threshold = {failure_threshold}
+cooldown_seconds = {cooldown_seconds}
+
+[[delegate.candidates]]
+name = "dead-candidate"
+endpoint = "http://127.0.0.1:1/v1"
+local = true
+model = "test-dead-model"
+
+[[delegation.chains]]
+task_type = "file_summarization"
+candidates = ["dead-candidate"]
+""",
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o600)
+
+
+@pytest.mark.asyncio
+async def test_cooldown_store_shared_between_mcp_tool_and_internal_route(
+    tmp_path, fixture_repo, fake_gortex_server
+):
+    """U4 (feat/delegate-candidate-circuit-breaker plan): a candidate
+    tripped into cooldown via the MCP tool path is skipped -- without a
+    second connection attempt -- via the internal HTTP route, proving
+    `daemon.py`'s `create_app()` actually shares ONE `CandidateCooldownStore`
+    between `build_delegate_server()` and `build_delegate_internal_route()`,
+    not two independently constructed ones. Complements U3's unit-level
+    coverage of the same requirement (R6) at the daemon-wiring level."""
+    config_path = tmp_path / "josu.toml"
+    _write_dead_candidate_josu_toml(config_path)
+    token = resolve_daemon_token(config_path)
+
+    port = _free_port()
+    app = create_app(target=fixture_repo, config_path=config_path, gortex_process=fake_gortex_server)
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    task = asyncio.create_task(server.serve())
+    for _ in range(50):
+        if server.started:
+            break
+        await asyncio.sleep(0.05)
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        # First attempt, via the MCP tool: the only candidate is dead, so
+        # this trips cooldown (failure_threshold=1) and reports chain
+        # exhaustion.
+        async with sse_client(f"{base_url}/delegate/sse?token={token}") as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    "delegate_to_local",
+                    {"task": "anything", "task_type": "file_summarization"},
+                )
+        assert "exhausted" in result.content[0].text.lower()
+
+        # Second attempt, via the internal HTTP route: if the cooldown store
+        # were NOT actually shared, this would independently attempt
+        # "dead-candidate" again (and eventually also fail via its own
+        # first failure). Instead, it must already see the candidate as
+        # cooled down -- also a 502 chain-exhausted response, but now
+        # without a fresh connection attempt being the cause.
+        async with httpx.AsyncClient(base_url=base_url) as client:
+            response = await client.post(
+                "/delegate/internal",
+                json={"task": "anything", "task_type": "file_summarization"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert response.status_code == 502
+        body = response.json()
+        assert body["error"] == "chain_exhausted"
+        assert "CandidateCooldownError" in body["detail"] or "cooldown" in body["detail"].lower()
+    finally:
+        server.should_exit = True
+        await task
+
+
 @pytest.mark.asyncio
 async def test_daemon_no_longer_serves_an_internal_graph_reindex_route(
     running_daemon, daemon_token, fixture_repo

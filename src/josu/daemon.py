@@ -42,6 +42,7 @@ from josu.daemon_auth import (
     load_or_create_daemon_token,
     resolve_daemon_token_path,
 )
+from josu.delegate.cooldown import CandidateCooldownStore
 from josu.delegate.internal_api import build_delegate_internal_route
 from josu.delegate.local_model import DEFAULT_TIMEOUT_SECONDS
 from josu.delegate.queue import DelegateQueue
@@ -157,6 +158,8 @@ def create_app(
     U14: exactly ONE `DelegateQueue` is constructed here and shared between
     `build_delegate_server()` (the MCP tool) and
     `build_delegate_internal_route()` (the internal delegate HTTP route).
+    The same holds for the one `CandidateCooldownStore` (feat/delegate-
+    candidate-circuit-breaker plan), constructed alongside it.
 
     U15: the daemon's shared-secret auth token (`daemon_auth.py`) is
     loaded/created alongside `josu.toml`'s own XDG-style config directory
@@ -219,18 +222,29 @@ def create_app(
 
     registry = {candidate.name: candidate for candidate in config.delegate.candidates}
     delegate_queue = DelegateQueue()
+    # Exactly ONE CandidateCooldownStore is constructed here and shared
+    # between `build_delegate_server()` (the MCP tool) and
+    # `build_delegate_internal_route()` (the internal delegate HTTP route),
+    # mirroring `delegate_queue`'s own construct-once-share-both pattern --
+    # a candidate tripped via either path is skipped via both.
+    cooldown_store = CandidateCooldownStore(
+        failure_threshold=config.candidate_failure_threshold,
+        cooldown_seconds=config.candidate_cooldown_seconds,
+    )
     delegate_server = build_delegate_server(
         graph_engine=engine,
         chains_config=config.chains,
         registry=registry,
         timeout=delegate_timeout,
         queue=delegate_queue,
+        cooldown_store=cooldown_store,
         client_factory=delegate_client_factory,
     )
     delegate_sse = SseServerTransport("/delegate/messages/")
 
     internal_delegate_route = build_delegate_internal_route(
         queue=delegate_queue,
+        cooldown_store=cooldown_store,
         chains_config=config.chains,
         registry=registry,
         graph_engine=engine,

@@ -45,6 +45,7 @@ without going through Claude Code or the MCP transport at all.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -59,6 +60,7 @@ from josu.delegate.client import (
     DelegateUnreachableError,
     OpenAICompatibleDelegateClient,
 )
+from josu.delegate.cooldown import CandidateCooldownStore
 from josu.delegate.local_model import DEFAULT_TIMEOUT_SECONDS, DelegateResult, delegate
 from josu.delegate.queue import DelegateQueue
 from josu.graph.engine import GraphEngine
@@ -81,7 +83,31 @@ _ADVANCE_ON: tuple[type[BaseException], ...] = (
     TimeoutError,
 )
 
+# KTD3 (feat/delegate-candidate-circuit-breaker plan): headroom the outer
+# `queue.run_chain()` timeout gets ABOVE each attempt's own `timeout`, so
+# `_attempt()`'s own inner `asyncio.wait_for()` around `delegate()` -- not
+# `run_chain()`'s outer one -- is what actually enforces the budget and
+# feeds `cooldown_store.record_failure()`. See `execute_chain()`'s own
+# comment at its use site for why this ordering is load-bearing, not
+# incidental.
+_OUTER_TIMEOUT_SAFETY_MARGIN_SECONDS = 5.0
+
 ClientFactory = Callable[[DelegateCandidate], DelegateClient]
+
+
+class CandidateCooldownError(DelegateError):
+    """Raised inside `_attempt()` when `cooldown_store.is_in_cooldown(name)`
+    is `True` -- a candidate this module has already decided is unhealthy,
+    skipped without ever building a client or making a network call.
+    Structurally identical to the `local`-candidate preflight-failure path
+    below: a `DelegateError` subclass raised before any real attempt, caught
+    by the same `except DelegateError as exc:` handler, so it flows through
+    `SkipRecord`/`ChainExhaustedError` with zero special-casing (see plan
+    Key Technical Decisions KTD1-KTD3, feat/delegate-candidate-circuit-
+    breaker plan)."""
+
+    def __init__(self, candidate_name: str) -> None:
+        super().__init__(candidate_name, "in cooldown")
 
 
 class NoCandidatesError(Exception):
@@ -160,6 +186,7 @@ async def execute_chain(
     chains_config: ChainsConfig,
     registry: Mapping[str, DelegateCandidate],
     queue: DelegateQueue,
+    cooldown_store: CandidateCooldownStore,
     graph_engine: GraphEngine | None = None,
     scope_root: Path | None = None,
     client_factory: ClientFactory | None = None,
@@ -171,8 +198,14 @@ async def execute_chain(
     Raises `NoCandidatesError` if the chain resolves empty, or `ChainExhaustedError`
     if every candidate fails -- whether via the R34 conditions (unreachable,
     rate-limited, API error), a candidate's own R24 same-candidate retry
-    (inside `delegate()`) being exhausted, or any mix of the two across the
-    chain (see module docstring).
+    (inside `delegate()`) being exhausted, or a candidate already in
+    cooldown (`cooldown_store`, feat/delegate-candidate-circuit-breaker
+    plan), or any mix of the three across the chain (see module docstring).
+
+    `cooldown_store` must be the SAME instance across every `execute_chain()`
+    call sharing a candidate registry -- a fresh store per call has no
+    memory of past failures and silently defeats the whole point of this
+    parameter (see plan Key Technical Decisions).
     """
     candidates = resolve_chain(task_type, chains_config, registry)
     if not candidates:
@@ -186,6 +219,18 @@ async def execute_chain(
         async def _attempt() -> DelegateResult:
             attempted.append(candidate.name)
 
+            # KTD1: this check must live HERE, inside execute_chain()'s own
+            # attempt loop -- not one layer up in resolve_chain()/
+            # resolve_proactive_check_chain() -- so that "every candidate is
+            # in cooldown" still produces a SkipRecord per candidate and
+            # reaches ChainExhaustedError below, rather than resolving to an
+            # empty candidate list and raising NoCandidatesError instead
+            # (which AE2 requires NOT to happen).
+            if cooldown_store.is_in_cooldown(candidate.name):
+                exc = CandidateCooldownError(candidate.name)
+                skip_records.append(SkipRecord(candidate=candidate.name, error=type(exc).__name__))
+                raise exc
+
             if candidate.local:
                 preflight = preflight_check(candidate.model, available_ram_gb=available_ram_gb)
                 if not preflight.ok:
@@ -197,24 +242,53 @@ async def execute_chain(
 
             client = factory(candidate)
             try:
-                return await delegate(
-                    task,
-                    scope,
-                    model=candidate.model,
-                    graph_engine=graph_engine,
-                    scope_root=scope_root,
-                    client=client,
+                # KTD3: `delegate()` is wrapped in its OWN `wait_for`, not
+                # left to `queue.run_chain()`'s outer one. `run_chain()`'s
+                # `asyncio.wait_for(fn(), timeout=timeout)` wraps this WHOLE
+                # `_attempt()` closure from the outside -- when IT fires,
+                # the resulting `TimeoutError` is raised at `run_chain()`'s
+                # own call site, never delivered to this `except` block, so
+                # a candidate that simply hangs would never call
+                # `record_failure()` without this inner wrapping.
+                result = await asyncio.wait_for(
+                    delegate(
+                        task,
+                        scope,
+                        model=candidate.model,
+                        graph_engine=graph_engine,
+                        scope_root=scope_root,
+                        client=client,
+                        timeout=timeout,
+                    ),
                     timeout=timeout,
                 )
-            except DelegateError as exc:
+            except (DelegateError, TimeoutError, asyncio.CancelledError) as exc:
                 # Every `DelegateError` subclass means "this candidate
                 # failed, try the next one" (R34) -- including
                 # `DelegateMalformedResponseError`, since `delegate()`
                 # already ran R24's one-retry-same-candidate before raising
-                # it here; no second retry is added in this module. Only
-                # `DelegateRateLimitedError` carries a `retry_after` value;
-                # `getattr` handles that uniformly without a separate except
-                # block per subclass.
+                # it here; no second retry is added in this module. A bare
+                # `TimeoutError` (KTD3) is the same "this candidate is
+                # unusable right now" signal, just from hanging rather than
+                # raising. Only `DelegateRateLimitedError` carries a
+                # `retry_after` value; `getattr` handles that uniformly
+                # without a separate except block per subclass.
+                #
+                # `asyncio.CancelledError` (code-review fix): if `delegate()`'s
+                # own cancellation cleanup (e.g. a real `httpx.AsyncClient`
+                # teardown, genuine async I/O, not instant) takes long enough
+                # that the OUTER `queue.run_chain()` wait_for's deadline is
+                # reached first, IT cancels this whole `_attempt()` coroutine
+                # from outside -- delivered here as `CancelledError`, not
+                # `TimeoutError`. Without catching it too, `record_failure()`
+                # would never fire for exactly the "candidate hangs badly
+                # enough that even its own cancellation is slow" case, no
+                # matter how generous `_OUTER_TIMEOUT_SAFETY_MARGIN_SECONDS`
+                # is. Re-raised unchanged below (`raise`, no swallowing) --
+                # catching-and-reraising to run cleanup is the correct,
+                # standard pattern; only catching-and-NOT-reraising would be
+                # the anti-pattern.
+                cooldown_store.record_failure(candidate.name)
                 skip_records.append(
                     SkipRecord(
                         candidate=candidate.name,
@@ -224,10 +298,22 @@ async def execute_chain(
                 )
                 raise
 
+            cooldown_store.record_success(candidate.name)
+            return result
+
         return _attempt
 
+    # KTD3: `run_chain()`'s `asyncio.wait_for()` starts timing from the very
+    # first line of `_attempt()`, strictly before the inner `wait_for()`
+    # around `delegate()` above even begins (after `attempted.append()`,
+    # the cooldown check, and the preflight check all run) -- so if both
+    # used the identical `timeout`, the OUTER one's deadline is always
+    # earlier and would win the race every time, meaning `_attempt()`'s own
+    # `except` block (where `record_failure()` lives) would never actually
+    # run. The safety margin makes the outer wrapping a true backstop.
     attempts: list[tuple[Callable[[], Awaitable[DelegateResult]], float]] = [
-        (_make_attempt(candidate), timeout) for candidate in candidates
+        (_make_attempt(candidate), timeout + _OUTER_TIMEOUT_SAFETY_MARGIN_SECONDS)
+        for candidate in candidates
     ]
 
     try:

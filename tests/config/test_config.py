@@ -12,6 +12,9 @@ from pathlib import Path
 import pytest
 
 from josu.config import (
+    DEFAULT_CANDIDATE_COOLDOWN_SECONDS,
+    DEFAULT_CANDIDATE_FAILURE_THRESHOLD,
+    DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS,
     ConfigPermissionError,
     check_permissions,
     load_config,
@@ -149,3 +152,98 @@ def test_load_config_defaults_chains_empty_when_no_delegation_section(tmp_path):
 
     config = load_config(config_path)
     assert config.chains.chains == []
+
+
+def test_load_config_parses_valid_candidate_cooldown_config(tmp_path):
+    """feat/delegate-candidate-circuit-breaker plan, U2: `[delegate].
+    failure_threshold`/`cooldown_seconds` parse into `JosuConfig` unchanged
+    when valid, coexisting with the same section's `[[delegate.candidates]]`
+    array-of-tables."""
+    config_path = tmp_path / "josu.toml"
+    config_path.write_text(
+        "[delegate]\n"
+        "failure_threshold = 5\n"
+        "cooldown_seconds = 30\n"
+        "\n"
+        "[[delegate.candidates]]\n"
+        'name = "local-candidate"\n'
+        'endpoint = "http://localhost:11434/v1"\n'
+        "local = true\n"
+        'model = "qwen2.5-coder:7b"\n',
+        encoding="utf-8",
+    )
+    os.chmod(config_path, 0o600)
+
+    config = load_config(config_path)
+    assert config.candidate_failure_threshold == 5
+    assert config.candidate_cooldown_seconds == 30.0
+    assert len(config.delegate.candidates) == 1
+    assert config.warnings == []
+
+
+def test_load_config_defaults_candidate_cooldown_config_when_delegate_section_absent(tmp_path):
+    config_path = tmp_path / "josu.toml"
+    _write_toml(config_path)
+    os.chmod(config_path, 0o600)
+
+    config = load_config(config_path)
+    assert config.candidate_failure_threshold == DEFAULT_CANDIDATE_FAILURE_THRESHOLD
+    assert config.candidate_cooldown_seconds == DEFAULT_CANDIDATE_COOLDOWN_SECONDS
+    assert config.warnings == []
+
+
+@pytest.mark.parametrize("bad_threshold", [0, -1, '"not-a-number"', "inf", "nan"])
+def test_load_config_falls_back_to_default_on_invalid_failure_threshold(tmp_path, bad_threshold):
+    config_path = tmp_path / "josu.toml"
+    config_path.write_text(
+        f"[delegate]\nfailure_threshold = {bad_threshold}\n\n"
+        "[[delegate.candidates]]\n"
+        'name = "local-candidate"\n'
+        'endpoint = "http://localhost:11434/v1"\n'
+        "local = true\n"
+        'model = "qwen2.5-coder:7b"\n',
+        encoding="utf-8",
+    )
+    os.chmod(config_path, 0o600)
+
+    config = load_config(config_path)
+    assert config.candidate_failure_threshold == DEFAULT_CANDIDATE_FAILURE_THRESHOLD
+    assert any("failure_threshold" in w for w in config.warnings)
+
+
+@pytest.mark.parametrize("bad_cooldown", [0, -1, '"not-a-number"', "inf", "nan"])
+def test_load_config_falls_back_to_default_on_invalid_cooldown_seconds(tmp_path, bad_cooldown):
+    config_path = tmp_path / "josu.toml"
+    config_path.write_text(
+        f"[delegate]\ncooldown_seconds = {bad_cooldown}\n\n"
+        "[[delegate.candidates]]\n"
+        'name = "local-candidate"\n'
+        'endpoint = "http://localhost:11434/v1"\n'
+        "local = true\n"
+        'model = "qwen2.5-coder:7b"\n',
+        encoding="utf-8",
+    )
+    os.chmod(config_path, 0o600)
+
+    config = load_config(config_path)
+    assert config.candidate_cooldown_seconds == DEFAULT_CANDIDATE_COOLDOWN_SECONDS
+    assert any("cooldown_seconds" in w for w in config.warnings)
+
+
+@pytest.mark.parametrize("bad_timeout", [0, -1, '"not-a-number"', "inf", "nan"])
+def test_load_config_falls_back_to_default_on_invalid_wall_clock_timeout(tmp_path, bad_timeout):
+    config_path = tmp_path / "josu.toml"
+    config_path.write_text(
+        f"[orchestrator]\nwall_clock_timeout_seconds = {bad_timeout}\n\n"
+        "[[delegate.candidates]]\n"
+        'name = "local-candidate"\n'
+        'endpoint = "http://localhost:11434/v1"\n'
+        "local = true\n"
+        'model = "qwen2.5-coder:7b"\n',
+        encoding="utf-8",
+    )
+    os.chmod(config_path, 0o600)
+
+    config = load_config(config_path)
+    assert config.wall_clock_timeout_seconds == DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS
+    assert any("wall_clock_timeout_seconds" in w for w in config.warnings)
