@@ -77,7 +77,8 @@ If a local candidate's context starts feeling tight, [Headroom](https://github.c
 ### Run it
 
 ```bash
-# 1. Start the daemon (connects to your configured graph-engine target, if any; serves both MCP servers + internal routes)
+# 1. Start the daemon (connects to your configured [[graph.engines]] target, if any; serves both MCP servers + internal routes)
+# --target here scopes graphify file reads and crash-orphaned-worktree scanning to this repo -- it does not select the graph engine
 uv run josu daemon start --target /path/to/your/repo
 
 # 2. In your repo, install the post-commit hook that drives proactive checks
