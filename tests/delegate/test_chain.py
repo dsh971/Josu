@@ -30,6 +30,7 @@ from josu.delegate.client import (
     DelegateUnreachableError,
 )
 from josu.delegate.cooldown import CandidateCooldownStore
+from josu.delegate.internal_api import _PRE_RESOLVED_CHAIN_KEY
 from josu.delegate.queue import DelegateQueue
 
 TASK_TYPE = "file_summarization"
@@ -503,8 +504,8 @@ async def test_successful_call_resets_previously_nonzero_failure_count():
     failures (fewer than the threshold) doesn't immediately trip cooldown."""
     candidate = _candidate("flaky-then-good")
     store = _fresh_cooldown_store(failure_threshold=3)
-    store.record_failure("flaky-then-good")
-    store.record_failure("flaky-then-good")
+    store.record_failure(TASK_TYPE, "flaky-then-good")
+    store.record_failure(TASK_TYPE, "flaky-then-good")
 
     good_client = FakeGoodClient(result="recovered")
     await execute_chain(
@@ -517,10 +518,10 @@ async def test_successful_call_resets_previously_nonzero_failure_count():
         client_factory=_factory({"flaky-then-good": good_client}),
     )
 
-    assert store.is_in_cooldown("flaky-then-good") is False
-    store.record_failure("flaky-then-good")
-    store.record_failure("flaky-then-good")
-    assert store.is_in_cooldown("flaky-then-good") is False  # count restarted from 0
+    assert store.is_in_cooldown(TASK_TYPE, "flaky-then-good") is False
+    store.record_failure(TASK_TYPE, "flaky-then-good")
+    store.record_failure(TASK_TYPE, "flaky-then-good")
+    assert store.is_in_cooldown(TASK_TYPE, "flaky-then-good") is False  # count restarted from 0
 
 
 @pytest.mark.asyncio
@@ -530,9 +531,9 @@ async def test_candidate_in_cooldown_is_skipped_without_delegate_call():
     candidate."""
     candidates = [_candidate("cooling-down"), _candidate("good")]
     store = _fresh_cooldown_store(failure_threshold=2)
-    store.record_failure("cooling-down")
-    store.record_failure("cooling-down")
-    assert store.is_in_cooldown("cooling-down") is True
+    store.record_failure(TASK_TYPE, "cooling-down")
+    store.record_failure(TASK_TYPE, "cooling-down")
+    assert store.is_in_cooldown(TASK_TYPE, "cooling-down") is True
 
     never_called_client = FakeGoodClient()
     good_client = FakeGoodClient(result="42")
@@ -559,8 +560,8 @@ async def test_candidate_attempted_again_after_cooldown_expires():
     candidate = _candidate("recovering")
     clock = _FakeClock()
     store = _fresh_cooldown_store(failure_threshold=1, cooldown_seconds=30, clock=clock)
-    store.record_failure("recovering")
-    assert store.is_in_cooldown("recovering") is True
+    store.record_failure(TASK_TYPE, "recovering")
+    assert store.is_in_cooldown(TASK_TYPE, "recovering") is True
 
     clock.now += 30
     good_client = FakeGoodClient(result="back")
@@ -606,7 +607,7 @@ async def test_candidate_that_hangs_past_timeout_records_failure():
 
     assert isinstance(exc_info.value.last_error, TimeoutError)
     assert exc_info.value.skip_records[0].candidate == "hanging"
-    assert store.is_in_cooldown("hanging") is True
+    assert store.is_in_cooldown(TASK_TYPE, "hanging") is True
 
 
 @pytest.mark.asyncio
@@ -635,18 +636,20 @@ async def test_cancelled_error_during_attempt_still_records_failure():
         )
 
     assert cancelling_client.calls == 1
-    assert store.is_in_cooldown("cancels-mid-flight") is True
+    assert store.is_in_cooldown(TASK_TYPE, "cancels-mid-flight") is True
 
 
 @pytest.mark.asyncio
-async def test_cooldown_state_shared_across_different_chains_for_same_candidate_name():
-    """Covers R6: cooldown state is a property of the candidate name, not
-    the chain/task_type that resolved it -- a candidate tripped via one
-    chain (standing in for the proactive-check chain) is skipped via a
-    different chain (standing in for a task-delegation chain) when both
-    share the same store instance."""
+async def test_cooldown_state_isolated_across_different_task_types_for_same_candidate_name():
+    """Covers R1, AE1 (feat/task-type-bucketed-delegate-cooldown plan): a
+    candidate tripped into cooldown via one task_type is attempted
+    normally -- not skipped -- via a different task_type, even when both
+    chains share the same store instance. Supersedes the pre-rekey
+    `..._shared_across_different_chains_...` version of this test, which
+    asserted the opposite (cooldown state leaking across task_types) as
+    the then-correct R6 behavior."""
     store = _fresh_cooldown_store(failure_threshold=1)
-    store.record_failure("shared-candidate")
+    store.record_failure(TASK_TYPE, "shared-candidate")
 
     candidate = _candidate("shared-candidate")
     other_chains_config = ChainsConfig(
@@ -659,20 +662,20 @@ async def test_cooldown_state_shared_across_different_chains_for_same_candidate_
         ],
         allow_remote=True,
     )
-    never_called_client = FakeGoodClient()
+    good_client = FakeGoodClient(result="unaffected")
 
-    with pytest.raises(ChainExhaustedError):
-        await execute_chain(
-            "directory_summarization",
-            "anything",
-            chains_config=other_chains_config,
-            registry={candidate.name: candidate},
-            queue=DelegateQueue(),
-            cooldown_store=store,
-            client_factory=_factory({"shared-candidate": never_called_client}),
-        )
+    outcome = await execute_chain(
+        "directory_summarization",
+        "anything",
+        chains_config=other_chains_config,
+        registry={candidate.name: candidate},
+        queue=DelegateQueue(),
+        cooldown_store=store,
+        client_factory=_factory({"shared-candidate": good_client}),
+    )
 
-    assert never_called_client.calls == 0
+    assert outcome.result == "unaffected"
+    assert good_client.calls == 1
 
 
 @pytest.mark.asyncio
@@ -686,8 +689,8 @@ async def test_every_candidate_cooled_down_raises_chain_exhausted_not_no_candida
     would get wrong."""
     candidates = [_candidate("cold-1"), _candidate("cold-2")]
     store = _fresh_cooldown_store(failure_threshold=1)
-    store.record_failure("cold-1")
-    store.record_failure("cold-2")
+    store.record_failure(TASK_TYPE, "cold-1")
+    store.record_failure(TASK_TYPE, "cold-2")
 
     never_called = {"cold-1": FakeGoodClient(), "cold-2": FakeGoodClient()}
 
@@ -720,7 +723,7 @@ async def test_mixed_chain_cooldown_skip_and_real_failure_distinguishable():
     generic reason."""
     candidates = [_candidate("cold"), _candidate("genuinely-dead")]
     store = _fresh_cooldown_store(failure_threshold=1)
-    store.record_failure("cold")
+    store.record_failure(TASK_TYPE, "cold")
 
     clients = {"cold": FakeGoodClient(), "genuinely-dead": FakeUnreachableClient()}
 
@@ -764,7 +767,7 @@ async def test_n_consecutive_failures_trip_candidate_into_cooldown_mid_test():
             )
 
     assert dead_client.calls == 2
-    assert store.is_in_cooldown("degrading") is True
+    assert store.is_in_cooldown(TASK_TYPE, "degrading") is True
 
     never_called = FakeGoodClient()
     with pytest.raises(ChainExhaustedError) as exc_info:
@@ -780,3 +783,35 @@ async def test_n_consecutive_failures_trip_candidate_into_cooldown_mid_test():
 
     assert isinstance(exc_info.value.last_error, CandidateCooldownError)
     assert never_called.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_pre_resolved_proactive_check_bucket_isolated_from_real_task_type():
+    """Covers R3 (feat/task-type-bucketed-delegate-cooldown plan): the
+    actual production proactive-check trigger is `internal_api.py`'s
+    pre-resolved-candidates branch, which buckets under
+    `_PRE_RESOLVED_CHAIN_KEY` -- not `PROACTIVE_CHECK_TASK_TYPE` via
+    `resolve_proactive_check_chain()`/`run_proactive_check()`, which have
+    zero in-repo production callers today. A candidate cooled down under
+    `_PRE_RESOLVED_CHAIN_KEY` must still be attempted normally for a real
+    task_type, and vice versa, sharing the same store instance."""
+    store = _fresh_cooldown_store(failure_threshold=1)
+    store.record_failure(_PRE_RESOLVED_CHAIN_KEY, "shared-candidate")
+
+    candidate = _candidate("shared-candidate")
+    good_client = FakeGoodClient(result="real-task-type-unaffected")
+
+    outcome = await execute_chain(
+        TASK_TYPE,
+        "anything",
+        chains_config=_chains_config(["shared-candidate"]),
+        registry={candidate.name: candidate},
+        queue=DelegateQueue(),
+        cooldown_store=store,
+        client_factory=_factory({"shared-candidate": good_client}),
+    )
+
+    assert outcome.result == "real-task-type-unaffected"
+    assert good_client.calls == 1
+    # The pre-resolved bucket itself is untouched by the real-task_type success above.
+    assert store.is_in_cooldown(_PRE_RESOLVED_CHAIN_KEY, "shared-candidate") is True
