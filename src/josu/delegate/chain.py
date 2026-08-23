@@ -96,9 +96,10 @@ ClientFactory = Callable[[DelegateCandidate], DelegateClient]
 
 
 class CandidateCooldownError(DelegateError):
-    """Raised inside `_attempt()` when `cooldown_store.is_in_cooldown(name)`
-    is `True` -- a candidate this module has already decided is unhealthy,
-    skipped without ever building a client or making a network call.
+    """Raised inside `_attempt()` when `cooldown_store.is_in_cooldown(task_type,
+    name)` is `True` -- a candidate this module has already decided is
+    unhealthy for this task_type, skipped without ever building a client or
+    making a network call.
     Structurally identical to the `local`-candidate preflight-failure path
     below: a `DelegateError` subclass raised before any real attempt, caught
     by the same `except DelegateError as exc:` handler, so it flows through
@@ -226,7 +227,7 @@ async def execute_chain(
             # reaches ChainExhaustedError below, rather than resolving to an
             # empty candidate list and raising NoCandidatesError instead
             # (which AE2 requires NOT to happen).
-            if cooldown_store.is_in_cooldown(candidate.name):
+            if cooldown_store.is_in_cooldown(task_type, candidate.name):
                 exc = CandidateCooldownError(candidate.name)
                 skip_records.append(SkipRecord(candidate=candidate.name, error=type(exc).__name__))
                 raise exc
@@ -288,7 +289,7 @@ async def execute_chain(
                 # catching-and-reraising to run cleanup is the correct,
                 # standard pattern; only catching-and-NOT-reraising would be
                 # the anti-pattern.
-                cooldown_store.record_failure(candidate.name)
+                cooldown_store.record_failure(task_type, candidate.name)
                 skip_records.append(
                     SkipRecord(
                         candidate=candidate.name,
@@ -298,7 +299,7 @@ async def execute_chain(
                 )
                 raise
 
-            cooldown_store.record_success(candidate.name)
+            cooldown_store.record_success(task_type, candidate.name)
             return result
 
         return _attempt
