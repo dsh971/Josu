@@ -97,9 +97,9 @@ ClientFactory = Callable[[DelegateCandidate], DelegateClient]
 
 class CandidateCooldownError(DelegateError):
     """Raised inside `_attempt()` when `cooldown_store.is_in_cooldown(task_type,
-    name)` is `True` -- a candidate this module has already decided is unhealthy
-    for this task_type,
-    skipped without ever building a client or making a network call.
+    name)` is `True` -- a candidate this module has already decided is
+    unhealthy for this task_type, skipped without ever building a client or
+    making a network call.
     Structurally identical to the `local`-candidate preflight-failure path
     below: a `DelegateError` subclass raised before any real attempt, caught
     by the same `except DelegateError as exc:` handler, so it flows through
